@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shielded Escrow</title>
+<style>
+  :root { --bg:#f6f5f1; --card:#fff; --ink:#1d1c1a; --mute:#6d6a63; --line:#e3e0d8; --accent:#c8851a; --ok:#2f7d4f; --bad:#b4372f; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161513; --card:#1f1e1b; --ink:#ece9e2; --mute:#9b978e; --line:#33312c; --accent:#e5a43c; --ok:#5fb884; --bad:#e0675c; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--mute); margin: 0 0 20px; }
+  .parties { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--mute); margin:0 0 6px; }
+  .big { font-size:22px; font-variant-numeric: tabular-nums; }
+  .note { color:var(--mute); font-size:13px; }
+  button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#1d1c1a; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { text-align:left; padding:8px 6px; border-top:1px solid var(--line); vertical-align:top; }
+  th { font-size:12px; color:var(--mute); font-weight:500; border-top:none; }
+  .mono { font-family:var(--mono); font-size:12px; word-break:break-all; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; border:1px solid var(--line); }
+  .pill.funded { border-color:var(--accent); color:var(--accent); }
+  .pill.released, .pill.refunded { border-color:var(--ok); color:var(--ok); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .grid2 { display:grid; grid-template-columns: minmax(0,1.1fr) minmax(0,1fr); gap:12px; margin-top:12px; }
+  pre { margin:0; white-space:pre-wrap; font-family:var(--mono); font-size:12px; max-height:420px; overflow:auto; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  @media (max-width: 760px) { .parties, .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Shielded 2-of-3 escrow on Zcash</h1>
+  <p class="sub">Buyer, seller and a neutral arbiter each hold one FROST share of a shielded address. Any two can pay out. The arbiter (Predge) can only co-sign the payout its signed verdict names, and can never move funds alone. Local regtest chain: Zebra 7 + Zaino, Ironwood pool.</p>
+
+  <section class="parties">
+    <div class="card"><h2>Buyer</h2><div class="big" id="w-buyer">–</div><div class="note">own wallet + 1 share per escrow</div></div>
+    <div class="card"><h2>Seller</h2><div class="big" id="w-seller">–</div><div class="note">own wallet + 1 share per escrow</div></div>
+    <div class="card"><h2>Arbiter (Predge)</h2><div class="big">0 ZEC</div><div class="note">no wallet; 1 share + Ed25519 verdict key</div></div>
+  </section>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <strong>Escrows</strong>
+      <button class="primary" id="new">New escrow: buyer pays 1 ZEC</button>
+    </div>
+    <table><thead><tr><th>Job</th><th>State</th><th>Escrow address</th><th>Actions</th></tr></thead><tbody id="jobs"></tbody></table>
+  </div>
+
+  <div class="grid2">
+    <div class="card"><strong>Live log</strong> <span class="note" id="busy"></span><pre id="log"></pre></div>
+    <div class="card"><strong>Verdict</strong> <span id="vstat" class="note">select a disputed job</span><pre id="verdict"></pre></div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (z) => z == null ? "–" : (z / 1e8).toFixed(4) + " ZEC";
+let jobs = [];
+async function refresh() {
+  const s = await (await fetch("/api/state")).json();
+  if (s.wallets.buyer !== undefined) { $("w-buyer").textContent = fmt(s.wallets.buyer); $("w-seller").textContent = fmt(s.wallets.seller); }
+  jobs = s.jobs.sort((a, b) => a.id < b.id ? 1 : -1);
+  $("busy").textContent = s.busy ? "running…" : "";
+  document.querySelectorAll("button").forEach((b) => b.disabled = s.busy);
+  $("jobs").innerHTML = jobs.map((j) => `<tr>
+    <td class="mono">${j.id}<div class="note">${j.terms.item}</div></td>
+    <td><span class="pill ${j.state}">${j.state}</span></td>
+    <td class="mono">${j.escrow_address.slice(0, 28)}…${j.payout_txid ? `<div class="note">payout ${j.payout_txid.slice(0, 16)}…</div>` : ""}</td>
+    <td><div class="row">${j.state === "funded" ? `
+      <button data-a="release" data-j="${j.id}">Release (buyer + seller)</button>
+      <button data-a="dispute-buyer" data-j="${j.id}">Dispute: no delivery</button>
+      <button data-a="dispute-seller" data-j="${j.id}">Dispute: delivered</button>` : ""}
+      ${j.verdict ? `<button data-v="${j.id}">View verdict</button>` : ""}</div></td></tr>`).join("");
+  document.querySelectorAll("[data-a]").forEach((b) => b.onclick = () => run(b.dataset.a, b.dataset.j));
+  document.querySelectorAll("[data-v]").forEach((b) => b.onclick = () => showVerdict(b.dataset.v));
+}
+function showVerdict(id) {
+  const j = jobs.find((x) => x.id === id);
+  $("vstat").innerHTML = j.verdict_valid ? `<span class="ok">Ed25519 signature valid</span>` : `<span class="bad">invalid</span>`;
+  $("verdict").textContent = JSON.stringify(j.verdict, null, 2);
+}
+async function run(action, job) {
+  await fetch(`/api/run?action=${action}${job ? `&job=${job}` : ""}`, { method: "POST" });
+  refresh();
+}
+$("new").onclick = () => run("new");
+const es = new EventSource("/api/log");
+es.onmessage = (e) => {
+  const line = JSON.parse(e.data);
+  if (line === "__done__") return refresh();
+  const log = $("log");
+  log.textContent += line + "\n";
+  log.scrollTop = log.scrollHeight;
+};
+refresh();
+</script>
+</body>
+</html>

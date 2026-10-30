@@ -1,0 +1,21 @@
+# Zebra 7.0.0 regtest for the escrow demo. Every upgrade through NU6.3 (Ironwood) activates at
+# height 2. NU7 stays off: Zaino 0.10.2 cannot parse the NU7 branch id yet (zingolabs/zaino#1655).
+[network]
+network = "Regtest"
+
+[network.testnet_parameters.activation_heights]
+BeforeOverwinter = 1
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 2
+NU6 = 2
+"NU6.1" = 2
+"NU6.2" = 2
+"NU6.3" = 2
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+enable_cookie_auth = false

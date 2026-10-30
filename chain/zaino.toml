@@ -1,0 +1,8 @@
+backend = "fetch"
+
+[validator_settings]
+validator_user = "zebra"
+validator_password = "zebra"
+
+[storage.database]
+size = 1

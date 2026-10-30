@@ -1,0 +1,49 @@
+# Private Zcash regtest chain for the escrow demo: Zebra 7.0.0 (validator) + Zaino 0.10.2
+# (lightwalletd-compatible gRPC for zcash-devtool). Ports bind to 127.0.0.1 only.
+name: zescrow
+
+services:
+  zebra:
+    image: zfnd/zebra:7.0.0
+    restart: unless-stopped
+    environment:
+      CONFIG_FILE_PATH: /etc/zebrad.toml
+      ZEBRA_MINING__MINER_ADDRESS: ${MINER_ADDRESS:?set MINER_ADDRESS (scripts/chain-up.sh does this)}
+      ZEBRA_STATE__CACHE_DIR: /home/zebra/.cache/zebra
+      ZEBRA_HEALTH__MIN_CONNECTED_PEERS: "0"
+      ZEBRA_HEALTH__ENFORCE_ON_TEST_NETWORKS: "false"
+      RUST_LOG: info
+    volumes:
+      - ./zebra.toml:/etc/zebrad.toml:ro
+      - chain:/home/zebra/.cache/zebra
+    ports:
+      - "127.0.0.1:18232:18232"
+    mem_limit: 1g
+
+  zaino:
+    image: zingodevops/zainod:0.10.2-no-tls
+    platform: linux/amd64
+    restart: unless-stopped
+    user: "1000:1000"
+    entrypoint:
+      - bash
+      - -c
+      - 'ip="$$(getent ahostsv4 "$$HOSTNAME")"; ip="$${ip%% *}"; export ZAINO_JSON_SERVER_SETTINGS__JSON_RPC_LISTEN_ADDRESS="$${ip}:8237"; exec /entrypoint.sh "$$@"'
+      - --
+    command: ["start", "--config", "/etc/zindexer.toml"]
+    environment:
+      RUST_LOG: info
+      ZAINO_NETWORK: Regtest
+      ZAINO_VALIDATOR_SETTINGS__VALIDATOR_JSONRPC_LISTEN_ADDRESS: zebra:18232
+      ZAINO_GRPC_SETTINGS__LISTEN_ADDRESS: 0.0.0.0:8137
+    volumes:
+      - ./zaino.toml:/etc/zindexer.toml:ro
+      - zaino:/app/data
+    ports:
+      - "127.0.0.1:8137:8137"
+    depends_on: [zebra]
+    mem_limit: 1g
+
+volumes:
+  chain:
+  zaino:
