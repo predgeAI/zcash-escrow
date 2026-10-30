@@ -15,7 +15,8 @@ chain can tell it is an escrow, who the parties are, or that there was a dispute
 The arbiter in this repo is Predge. The protocol does not depend on that: the parties can
 choose any arbiter that runs the same verdict-and-co-sign service.
 
-Status: working MVP on a private regtest chain. **Do not use with real funds.**
+Status: working MVP on a private regtest chain and on the public Zcash testnet (three payouts
+and the arbiter's refusal, run on testnet on 31.10.2026). **Do not use with real funds.**
 
 ## What works today (verified by running it)
 
@@ -23,14 +24,28 @@ Status: working MVP on a private regtest chain. **Do not use with real funds.**
 payout below is a real v6 transaction, authorized by a 2-of-3 rerandomized FROST signature,
 accepted by Zebra and mined.
 
-| Path | Signers | Result in the last run |
+| Path | Signers | Result in the last run (31.10.2026) |
 |---|---|---|
-| A. Release | buyer + seller | seller paid 0.9999 ZEC, tx `69167862…5f94` |
-| B. Dispute, nothing delivered | buyer + arbiter | buyer refunded 1.9999 ZEC, tx `b1b985dd…00c5` |
+| A. Release | buyer + seller | seller paid 0.9999 ZEC, tx `30fc8ff6…cbbb` |
+| B. Dispute, nothing delivered | buyer + arbiter | buyer refunded 1.9999 ZEC, tx `214db34f…123d` |
 | B'. Arbiter asked to pay the loser instead | arbiter alone checks | **refused**: "PCZT pays 0 zat to the agreed address" |
-| C. Dispute, delivery proven | seller + arbiter | seller paid 2.9999 ZEC, tx `7d31c634…9734` |
+| C. Dispute, delivery proven | seller + arbiter | seller paid 2.9999 ZEC, tx `a8543ad2…31f5` |
 
 The full run takes about 3.5 minutes on an M-series Mac. Proving takes about 3 s per payout.
+
+**Public testnet, 31.10.2026** (`npm run testnet`, NU7, v6 Ironwood transactions via the
+`zecrocks` lightwalletd). Same code, same 2-of-3 FROST signing; every transaction below is
+mined on testnet:
+
+| Path | Signers | Escrow | Funding tx (height) | Payout tx (height) |
+|---|---|---|---|---|
+| B. Dispute, nothing delivered | buyer + arbiter | 0.1 TAZ, buyer refunded 0.0999 | `9be35e8ee4e8ac867e29f7bd3929161fb1cc5b6043a29adafc5360a201ced80d` (4560069) | `2bc943804f1b30eb256a3f33b79a60677621c01e4cb41320ba7a32ee70c1f711` (4560131) |
+| B'. Arbiter asked to pay the seller instead | arbiter alone checks | same escrow as B | (no tx) | **refused**: "PCZT pays 0 zat to the agreed address, expected >= 9980000" |
+| A. Release | buyer + seller | 0.05 TAZ, seller paid 0.0499 | `b3287844c5f166ba93b2511c5827dc5feab8537fe7ddceca5639d6a517e3e807` (4560131) | `a22f6d89cb456f2613a077114f47ae220efae147aa3cbf7763ef647d365b40f9` (4560141) |
+| C. Dispute, delivery proven | seller + arbiter | 0.05 TAZ, seller paid 0.0499 | `0ef86d4ef8450af48b15f9f0e10ea02b72ecf185da71f1c1e1e366781aeb5e19` (4560174) | `1e54334c4ee9afdd0c678548fdfc9da71a638b090377589ecd30eea39a5899d9` (4560212) |
+
+Each escrow took about 15–25 minutes on testnet: the deposit needs 10 confirmations before the
+view-only escrow wallet will spend it, and payouts waited from 1 to about 35 blocks to be mined.
 
 | Part | Status |
 |---|---|
@@ -42,7 +57,7 @@ The full run takes about 3.5 minutes on an M-series Mac. Proving takes about 3 s
 | Verdicts | Ed25519-signed canonical JSON: job id, decision, reasons, evidence hashes, exact payout. Anyone can check it offline (`zescrow verify`). The payout memo carries the verdict hash. |
 | Adjudication | **stub rule** for sealed-listing digital goods (below). Real evidence review plugs in at `adjudicate()`. |
 | Signer transport | **stub**: round messages are JSON files relayed by a local coordinator. Milestone 1 moves this to ZF `frostd`. |
-| Network | regtest only. No working testnet faucet was reachable; the testnet path needs about 0.1 TAZ (see "Testnet"). |
+| Network | regtest (`npm run demo`) and public testnet (`npm run testnet`, see "Testnet"). Testnet signing uses a locally patched `zcash-sign` build, because the pinned one does not know the NU7 branch id. |
 
 ## Run it
 
@@ -195,10 +210,29 @@ peer-to-peer messaging, transaction delivery, share backup, and recovery.
 
 ## Testnet
 
-The code is network-agnostic. Testnet needs:
-- the `-n test` / `-s zecrocks` settings;
-- dropping the regtest re-encode;
-- a funded buyer wallet, about 0.1 TAZ.
+`ZESCROW_NETWORK=test` switches the app to the public testnet. What changes:
+- wallets use `-n test` and the `zecrocks` lightwalletd; state lives in `.state-testnet/`;
+- the escrow address and UFVK from `zcash-sign generate -n test` are used as they are (no
+  regtest re-encode, no height pinning);
+- there is no mining: the app polls the light wallets until the deposit is spendable (10
+  confirmations) and until the payout is mined;
+- the buyer is a pre-funded wallet in `.testnet-buyer/` (seed age-encrypted to
+  `.testnet-buyer/identity.age`, both git-ignored). About 0.25 TAZ covers all three escrows.
+- `zcash-sign sign` runs from a second build (`scripts/build-deps.sh --testnet`): the same
+  frost-tools commit with `scripts/zcash-sign-nu7.patch`, which moves it to zcash-devtool's
+  librustzcash rev so it knows the testnet NU7 branch id (`0x77190ad9`). The pinned build fails
+  on testnet with `UnknownConsensusBranchId`. Only `sign` works in the patched build; orchard
+  0.16 has no FROST FVK constructor, so `generate` still uses the pinned build.
+
+```bash
+./scripts/build-deps.sh --testnet
+cd app && npm run testnet          # paths B (with B'), A, C; or: npm run testnet -- B
+ZESCROW_NETWORK=test npx tsx src/cli.ts enforce <job>   # resume a funded job after an error
+```
+
+Results from 31.10.2026 are in the table under "What works today". In that run the buyer wallet
+went from 1.0 TAZ to 0.89945 TAZ, and the seller wallet received 0.0998 TAZ. Fees were 0.00075 TAZ
+in total (ZIP 317: 0.00025 for the first deposit, 0.0001 for each other transaction).
 
 ZF frost-tools PR #593 already showed 2-of-3 FROST spends of Ironwood notes on public testnet
 (txs `c5a1c4a1…410e`, `23ec9a37…7740`).
@@ -233,7 +267,7 @@ crates/zescrow-frost/  per-party FROST CLI over ZF reddsa / frost-rerandomized (
 app/src/escrow.ts      protocol: jobs, funding, PCZT payout, signer checks, verdict enforcement
 app/src/verdict.ts     verdict schema, Ed25519 signing, adjudication rule
 app/src/cli.ts         demo + verify; app/src/server.ts + app/ui: demo UI
-scripts/          build-deps.sh (pinned upstream tools), chain-up.sh
+scripts/          build-deps.sh (pinned upstream tools), chain-up.sh, zcash-sign-nu7.patch (testnet signing)
 ```
 
 License: MIT.

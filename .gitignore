@@ -1,4 +1,6 @@
 .state/
+.state-testnet/
+.testnet-buyer/
 node_modules/
 target/
 *.log

@@ -6,25 +6,28 @@
 //   arbiter : its FROST share for each job + an Ed25519 verdict key. No wallet, no seed.
 // The escrow address itself is a FROST group key: 2 of {buyer, seller, arbiter} must sign.
 // The coordinator (this process) only relays public round messages and PCZTs; it holds no secret.
+// Network: regtest by default; ZESCROW_NETWORK=test runs on the public testnet (see tools.ts).
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { BIN, LIGHTWALLETD, ROOT, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
+import { BIN, LIGHTWALLETD, NETWORK, ROOT, TESTNET, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
 import {
   adjudicate, canonical, loadArbiterKey, sha256, signVerdict, verifyVerdict,
   type Decision, type EvidenceItem, type SignedVerdict, type Terms, type Verdict,
 } from "./verdict.ts";
 
-export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, ".state");
+export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, TESTNET ? ".state-testnet" : ".state");
+// Testnet has no coinbase faucet: the buyer is a wallet funded beforehand (seed age-encrypted inside it).
+const TESTNET_BUYER = process.env.ZESCROW_BUYER_WALLET ?? join(ROOT, ".testnet-buyer");
 const HEIGHTS = join(ROOT, "chain/activation-heights.toml");
 const COMPOSE = join(ROOT, "chain/compose.yaml");
 const FEE_ALLOWANCE_ZAT = 20_000; // ZIP 317: 2 logical actions x 5,000 zat today, with headroom
 
 type Party = "buyer" | "seller" | "arbiter";
 const partyDir = (p: Party) => join(STATE, "parties", p);
-const walletDir = (p: "buyer" | "seller") => join(partyDir(p), "wallet");
-const ageFile = (p: "buyer" | "seller") => join(partyDir(p), "wallet.age");
+export const walletDir = (p: "buyer" | "seller") => (TESTNET && p === "buyer" ? TESTNET_BUYER : join(partyDir(p), "wallet"));
+const ageFile = (p: "buyer" | "seller") => (TESTNET && p === "buyer" ? join(TESTNET_BUYER, "identity.age") : join(partyDir(p), "wallet.age"));
 const jobDir = (job: string) => join(STATE, "jobs", job);
 const shareFile = (p: Party, job: string) => join(partyDir(p), "shares", `${job}.key.json`);
 const readJson = <T>(p: string): T => JSON.parse(readFileSync(p, "utf8")) as T;
@@ -42,8 +45,10 @@ export interface Job {
   group_ak: string;
   funded_zat?: number;
   fund_txid?: string;
+  fund_height?: number;
   state: "created" | "funded" | "released" | "refunded";
   payout_txid?: string;
+  payout_height?: number;
   verdict_sha256?: string;
 }
 
@@ -62,6 +67,29 @@ export function balance(dir: string): { ironwood: number; total: number; tip: nu
   return { ironwood: j.ironwood_spendable, total: j.total, tip: j.chain_tip_height };
 }
 
+/** Height at which `txid` was mined, as seen by the wallet in `dir` (sync it first). */
+function minedHeight(dir: string, txid: string): number | undefined {
+  const txs = JSON.parse(devtool(["wallet", "-w", dir, "list-tx", "--json"], { quiet: true }).trim().split("\n").pop()!) as
+    { txid: string; mined_height: number | null }[];
+  return txs.find((t) => t.txid === txid)?.mined_height ?? undefined;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Testnet: no mining, so poll the light wallet until `done` holds (blocks are ~75 s apart). */
+async function waitChain(what: string, done: () => { ok: boolean; tip: number }, minutes = 90) {
+  const until = Date.now() + minutes * 60_000;
+  let shown = 0;
+  for (;;) {
+    const { ok, tip } = done();
+    if (ok) return tip;
+    if (Date.now() > until) throw new Error(`timed out after ${minutes} min waiting for ${what} (tip ${tip})`);
+    if (tip !== shown) say(`  waiting for ${what}, testnet tip ${tip}`);
+    shown = tip;
+    await sleep(20_000);
+  }
+}
+
 /** zcash-devtool's view-only import writes its built-in regtest heights; make them match the chain. */
 function pinHeights(dir: string) {
   const cfg = join(dir, "keys.toml");
@@ -76,15 +104,23 @@ export function partyAddress(p: "buyer" | "seller"): string {
 
 /** One-time: party wallets, arbiter verdict key, and point Zebra's coinbase at the buyer. */
 export async function setup(): Promise<void> {
-  say("== setup: party wallets and arbiter key");
+  say(`== setup: party wallets and arbiter key (${NETWORK})`);
+  if (TESTNET && !existsSync(join(walletDir("buyer"), "keys.toml"))) {
+    throw new Error(`testnet buyer wallet missing at ${walletDir("buyer")}; create and fund it first (about 0.1 TAZ)`);
+  }
   for (const p of ["buyer", "seller"] as const) {
     if (existsSync(join(walletDir(p), "keys.toml"))) continue;
     mkdirSync(partyDir(p), { recursive: true });
+    if (TESTNET) {
+      devtool(["wallet", "-w", walletDir(p), "init", "--name", p, "-i", ageFile(p), "-n", "test", "-s", LIGHTWALLETD]);
+      continue;
+    }
     devtool(["wallet", "-w", walletDir(p), "init", "--name", p, "-i", ageFile(p), "-n", "regtest",
       "--activation-heights", HEIGHTS, "-s", LIGHTWALLETD]);
   }
   const arb = loadArbiterKey(join(partyDir("arbiter"), "verdict-ed25519.pem"));
   say(`  arbiter verdict key ${arb.pubHex}`);
+  if (TESTNET) return;
   const buyerUa = partyAddress("buyer");
   const info = readMeta();
   if (info.miner !== buyerUa) {
@@ -109,6 +145,12 @@ function readMeta(): { miner?: string } {
 export async function ensureBuyerFunds(need: number) {
   let b = balance(walletDir("buyer"));
   if (b.ironwood >= need) return;
+  if (TESTNET) {
+    // Change from an earlier payment needs a few confirmations before it is spendable again.
+    if (b.total < need) throw new Error(`testnet buyer holds ${fmt(b.total)}, needs ${fmt(need)}`);
+    await waitChain(`buyer to have ${fmt(need)} spendable`, () => { b = balance(walletDir("buyer")); return { ok: b.ironwood >= need, tip: b.tip }; });
+    return;
+  }
   say(`  buyer has ${fmt(b.ironwood)} spendable; mining coinbase to the buyer`);
   await mine(101);
   await waitIndexer();
@@ -129,7 +171,7 @@ async function waitIndexer() {
   throw new Error("light wallet did not catch up with Zebra");
 }
 
-export const fmt = (zat: number) => `${(zat / 1e8).toFixed(8)} ZEC`;
+export const fmt = (zat: number) => `${(zat / 1e8).toFixed(8)} ${TESTNET ? "TAZ" : "ZEC"}`;
 
 // ---------- job lifecycle ----------
 
@@ -158,18 +200,21 @@ export function createJob(id: string, item: { name: string; bytes: Buffer; price
   rmSync(tmp, { recursive: true });
   const ak = frost(["ak", "--group", join(jobDir(id), "group.json")]).trim();
   // ZF zcash-sign derives the escrow's full viewing key and address from the group key.
+  // It encodes for testnet; on regtest the app re-encodes the same keys with the regtest HRPs.
   const gen = spawnSync(BIN.zcashSign, ["generate", "--ak", ak, "-n", "test"], { encoding: "utf8" });
   if (gen.status !== 0) throw new Error(gen.stderr);
   const ua = /address: "(\S+)"/.exec(gen.stdout)![1];
   const ufvk = /Viewing Key: "(\S+)"/.exec(gen.stdout)![1];
+  const enc = (v: string) => (TESTNET ? v : frost(["reencode", "--value", v, "--network", "regtest"]).trim());
   const job: Job = {
     id, terms, terms_sha256: sha256(canonical(terms)), group_ak: ak, state: "created",
-    escrow_address: frost(["reencode", "--value", ua, "--network", "regtest"]).trim(),
-    escrow_ufvk: frost(["reencode", "--value", ufvk, "--network", "regtest"]).trim(),
+    escrow_address: enc(ua),
+    escrow_ufvk: enc(ufvk),
   };
   const w = join(jobDir(id), "wallet");
+  // Birthday defaults to the current tip, so the view-only wallet never scans old blocks.
   devtool(["wallet", "-w", w, "init-fvk", "--name", `escrow-${id}`, "--fvk", job.escrow_ufvk, "-s", LIGHTWALLETD], { quiet: true });
-  pinHeights(w);
+  if (!TESTNET) pinHeights(w);
   writeJson(join(jobDir(id), "terms.json"), terms);
   saveJob(job);
   say(`  escrow address ${job.escrow_address.slice(0, 32)}…  (FROST group key ${ak.slice(0, 16)}…)`);
@@ -189,9 +234,18 @@ export async function fund(id: string): Promise<Job> {
   const out = devtool(["wallet", "-w", walletDir("buyer"), "send", "-i", ageFile("buyer"), "--address", job.escrow_address,
     "--value", String(job.terms.price_zat), "--memo", `zescrow fund ${id} terms ${job.terms_sha256.slice(0, 16)}`, "-s", LIGHTWALLETD]);
   job.fund_txid = out.trim().split("\n").pop();
-  await mine(10);
-  await waitIndexer();
-  const b = balance(join(jobDir(id), "wallet"));
+  saveJob(job);
+  const ew = join(jobDir(id), "wallet");
+  if (TESTNET) {
+    // The deposit is spendable by the escrow after 10 confirmations (zcash-devtool's untrusted-note policy).
+    say(`  fund tx ${job.fund_txid}`);
+    await waitChain("the deposit to confirm in the escrow wallet", () => { const b = balance(ew); return { ok: b.ironwood >= job.terms.price_zat, tip: b.tip }; }, 120);
+    job.fund_height = minedHeight(ew, job.fund_txid!);
+  } else {
+    await mine(10);
+    await waitIndexer();
+  }
+  const b = balance(ew);
   if (b.ironwood < job.terms.price_zat) throw new Error(`escrow shows ${b.ironwood} zat, expected ${job.terms.price_zat}`);
   job.funded_zat = b.ironwood;
   job.state = "funded";
@@ -213,7 +267,7 @@ function pcztOutputs(pczt: string): PcztOutput[] {
 /** Independently recompute the sighash and randomizers of a PCZT with ZF zcash-sign. */
 function pcztSighash(pczt: string): Promise<{ sighash: string; alphas: string[] }> {
   return new Promise((res, rej) => {
-    const p = spawn(BIN.zcashSign, ["sign", "-i", pczt, "-o", "/dev/null", "-n", "test"]);
+    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", pczt, "-o", "/dev/null", "-n", "test"]);
     let out = "";
     p.stdout.on("data", (d) => {
       out += d;
@@ -287,11 +341,18 @@ async function payout(job: Job, to: string, memo: string, signers: [Party, Party
   const signed = await frostSign(job, signers, proven, { to, min: (job.funded_zat ?? job.terms.price_zat) - FEE_ALLOWANCE_ZAT }, arbiterGate);
   const out = devtool(["pczt", "-w", w, "send", "-s", LIGHTWALLETD, signed]);
   const txid = out.trim().split("\n").pop()!;
-  await mine(10);
-  await waitIndexer();
+  let height: number | undefined;
+  if (TESTNET) {
+    say(`  payout tx ${txid} broadcast`);
+    await waitChain("the payout to be mined", () => { const b = balance(w); height = minedHeight(w, txid); return { ok: height !== undefined, tip: b.tip }; });
+    say(`  payout mined at height ${height}`);
+  } else {
+    await mine(10);
+    await waitIndexer();
+  }
   const left = balance(w);
   if (left.total !== 0) throw new Error(`escrow still holds ${left.total} zat after payout`);
-  return txid;
+  return { txid, height };
 }
 
 /** Happy path: buyer is satisfied; buyer + seller sign the payout to the seller. No arbiter involved. */
@@ -299,7 +360,7 @@ export async function release(id: string): Promise<Job> {
   const job = loadJob(id);
   if (job.state !== "funded") throw new Error(`job ${id} is ${job.state}`);
   say(`== job ${id}: release (buyer + seller co-sign, arbiter not involved)`);
-  job.payout_txid = await payout(job, job.terms.seller_payout_address, `zescrow release ${id}`, ["buyer", "seller"]);
+  ({ txid: job.payout_txid, height: job.payout_height } = await payout(job, job.terms.seller_payout_address, `zescrow release ${id}`, ["buyer", "seller"]));
   job.state = "released";
   saveJob(job);
   say(`  paid seller: tx ${job.payout_txid}`);
@@ -365,7 +426,8 @@ export async function enforceVerdict(id: string): Promise<Job> {
   const gate = (sighash: string) => {
     writeJson(join(jobDir(id), "arbiter-cosign.json"), { verdict_sha256: vhash, sighash, at: new Date().toISOString() });
   };
-  job.payout_txid = await payout(job, sv.verdict.payout.to, `zescrow verdict ${vhash.slice(0, 32)}`, [sv.verdict.cosigner_with, "arbiter"], gate);
+  ({ txid: job.payout_txid, height: job.payout_height } =
+    await payout(job, sv.verdict.payout.to, `zescrow verdict ${vhash.slice(0, 32)}`, [sv.verdict.cosigner_with, "arbiter"], gate));
   job.state = sv.verdict.decision === "release_to_seller" ? "released" : "refunded";
   job.verdict_sha256 = vhash;
   saveJob(job);

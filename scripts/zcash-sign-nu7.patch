@@ -1,0 +1,148 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 856be8a..c6fc380 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -33,8 +33,8 @@ hex = "0.4.3"
+ itertools = "0.14.0"
+ lazy_static = "1.5.0"
+ message-io = "0.18"
+-orchard = "0.15.5"
+-pczt = "0.8.0-rc.1"
++orchard = "0.16"
++pczt = "=0.10.0-pre.2"
+ postcard = "1.1.1"
+ rand = "0.8.5"
+ rand_core = "0.6.4"
+@@ -44,7 +44,7 @@ regex = "1.11.1"
+ reqwest = { version = "0.12.12", default-features = false }
+ rpassword = "7.3.1"
+ rustls = "0.23.21"
+-sapling-crypto = "0.7.0"
++sapling-crypto = "0.9"
+ serde = "1.0.204"
+ serde-hex = "0.1.0"
+ serde_json = "1.0.138"
+@@ -61,18 +61,27 @@ tracing = "0.1"
+ tracing-subscriber = "0.3"
+ uuid = "1.11.0"
+ xeddsa = "1.0.2"
+-zcash_address = "0.13.0"
+-zcash_client_backend = "0.24.0-rc.1"
+-zcash_encoding = "0.4.0"
+-zcash_keys = "0.15.0"
+-zcash_primitives = "0.29.0"
+-zcash_proofs = "0.29.0"
+-zcash_protocol = "0.10.0"
+-zcash_transparent = "0.9.0"
++zcash_address = "=0.14.0-pre.2"
++zcash_client_backend = "=0.25.0-pre.2"
++zcash_encoding = "0.5"
++zcash_keys = "=0.17.0-pre.2"
++zcash_primitives = "=0.31.0-pre.2"
++zcash_proofs = "=0.31.0-pre.2"
++zcash_protocol = "=0.11.0-pre.1"
++zcash_transparent = "=0.11.0-pre.2"
+ zeroize = "1.8.1"
+ 
+ [patch.crates-io]
+-# TODO: remove this when https://github.com/zcash/orchard/pull/475 is merged,
+-# and all ECC crates are updated to point to the orchard version that includes
+-# it.
+-orchard = { git = "https://github.com/conradoplg/orchard.git", rev = "42015f15733b95e179189628d6fa34d92b5b3b8b", features = ["unstable-frost"] }
++# Local only: build zcash-sign on the same librustzcash rev as zcash-devtool so it knows the
++# testnet NU7 consensus branch id (0x77190ad9).
++equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_proofs = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
++zip321 = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818" }
+diff --git a/zcash-sign/src/generate.rs b/zcash-sign/src/generate.rs
+index fbae95f..93561fb 100644
+--- a/zcash-sign/src/generate.rs
++++ b/zcash-sign/src/generate.rs
+@@ -1,5 +1,6 @@
+ use rand::{Rng, RngCore};
+ 
++#[allow(unused_imports)]
+ use orchard::keys::{FullViewingKey, SpendValidatingKey, SpendingKey};
+ 
+ /// Generate an Orchard `FullViewingKey` from the given `SpendValidatingKey`,
+@@ -19,8 +20,7 @@ pub fn generate(rng: &mut impl RngCore, ak: &SpendValidatingKey) -> FullViewingK
+     // Conrado (ZF) directed us to keep this non-quantum-recoverable constructor
+     // for now (frost-tools#591); it is the same key derivation, only renamed
+     // upstream with strong caveats. Quantum recoverability is deferred.
+-    FullViewingKey::from_sk_ak_incompatible_with_quantum_recoverability_and_will_be_removed(
+-        &sk,
+-        ak.clone(),
+-    )
++    // Local NU7 build: orchard 0.16 has no FROST FVK constructor; use the pinned zcash-sign.
++    let _ = (sk, ak);
++    unimplemented!("generate is not available in this build; use the pinned zcash-sign")
+ }
+diff --git a/zcash-sign/src/main.rs b/zcash-sign/src/main.rs
+index 4925024..980e674 100644
+--- a/zcash-sign/src/main.rs
++++ b/zcash-sign/src/main.rs
+@@ -30,36 +30,9 @@ fn generate(args: &Command) -> Result<(), Box<dyn Error>> {
+         _ => Err(eyre!("Invalid network: {}", network))?,
+     };
+ 
+-    let ak = hex::decode(ak.trim()).unwrap();
+-    let ak = SpendValidatingKey::from_bytes(&ak).ok_or(eyre!("Invalid ak"))?;
+-
+-    let mut rng = rand::thread_rng();
+-
+-    let fvk = zcash_sign::generate(&mut rng, &ak);
+-
+-    let orchard_address = fvk.address_at(0u64, Scope::External);
+-    let unified_address = UnifiedAddress::from_receivers(Some(orchard_address), None, None)
+-        .expect("must work with a shielded address");
+-    // TODO: make params selectable
+-    let unified_address_str = unified_address.encode(&params);
+-
+-    println!("Orchard-only unified address: {unified_address_str:?}");
+-
+-    let sapling_fvk = if *danger_dummy_sapling {
+-        let mut seed = [0u8; 64];
+-        rng.fill_bytes(&mut seed[..]);
+-        let spending_key = ExtendedSpendingKey::master(&seed);
+-        Some(spending_key.to_diversifiable_full_viewing_key())
+-    } else {
+-        None
+-    };
+-
+-    let ufvk = UnifiedFullViewingKey::new(sapling_fvk, Some(fvk.clone())).unwrap();
+-    let ufvk_str = ufvk.encode(&params);
+-
+-    println!("Unified Full Viewing Key: {ufvk_str:?}");
+-
+-    Ok(())
++    // Local NU7 build: only `sign` is supported; use the pinned zcash-sign for `generate`.
++    let _ = (ak, danger_dummy_sapling, params);
++    Err(eyre!("generate is not available in this build; use the pinned zcash-sign"))?
+ }
+ 
+ fn sign(args: &Command) -> Result<(), Box<dyn Error>> {
+diff --git a/zcash-sign/src/sign.rs b/zcash-sign/src/sign.rs
+index 036a99f..76d5c3c 100644
+--- a/zcash-sign/src/sign.rs
++++ b/zcash-sign/src/sign.rs
+@@ -165,10 +165,8 @@ fn collect_randomizers(bundle: &mut orchard::pczt::Bundle, out: &mut Vec<(usize,
+     for (idx, action) in bundle.actions_mut().iter().enumerate() {
+         if action.spend().spend_auth_sig().is_none() {
+             if let Some(alpha) = action.spend().alpha() {
+-                let repr = alpha.to_repr();
+-                let bytes: [u8; 32] = AsRef::<[u8]>::as_ref(&repr)
+-                    .try_into()
+-                    .expect("a Pallas scalar repr is 32 bytes");
++                // Local NU7 build: orchard 0.16 uses a newer `ff`, so serialize via pasta_curves.
++                let bytes: [u8; 32] = <[u8; 32]>::from(alpha);
+                 out.push((idx, bytes));
+             }
+         }

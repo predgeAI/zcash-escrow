@@ -3,6 +3,8 @@
 //   zcash-sign     (ZF frost-tools): PCZT sighash + randomizer extraction, signature injection
 //   zescrow-frost  (this repo, over ZF reddsa/frost-rerandomized): per-party FROST rounds
 //   zebrad         (ZF): regtest validator, block mining via the `generate` RPC
+// ZESCROW_NETWORK=test runs the same protocol on the public Zcash testnet (via the zecrocks
+// lightwalletd); there is no mining there, so the app waits for real blocks instead.
 
 import { spawn, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
@@ -12,9 +14,16 @@ export const DEPS = process.env.ZESCROW_DEPS ?? resolve(ROOT, "../predge-zcash-e
 export const BIN = {
   devtool: process.env.ZCASH_DEVTOOL ?? `${DEPS}/zcash-devtool/target/release/zcash-devtool`,
   zcashSign: process.env.ZCASH_SIGN ?? `${DEPS}/frost-tools/target/release/zcash-sign`,
+  // `zcash-sign sign` must know the chain's consensus branch id. The pinned build stops at NU6.3,
+  // which is enough for regtest; testnet runs NU7, so sign there with the NU7 build
+  // (scripts/build-deps.sh --testnet). `generate` always uses the pinned build.
+  zcashSignPczt: process.env.ZCASH_SIGN_PCZT ??
+    (process.env.ZESCROW_NETWORK === "test" ? `${DEPS}/frost-tools-nu7/target/release/zcash-sign` : process.env.ZCASH_SIGN ?? `${DEPS}/frost-tools/target/release/zcash-sign`),
   frost: process.env.ZESCROW_FROST ?? `${ROOT}/crates/zescrow-frost/target/release/zescrow-frost`,
 };
-export const LIGHTWALLETD = process.env.LIGHTWALLETD ?? "localhost:8137";
+export const NETWORK: "regtest" | "test" = process.env.ZESCROW_NETWORK === "test" ? "test" : "regtest";
+export const TESTNET = NETWORK === "test";
+export const LIGHTWALLETD = process.env.LIGHTWALLETD ?? (TESTNET ? "zecrocks" : "localhost:8137");
 export const ZEBRA_RPC = process.env.ZEBRA_RPC ?? "http://127.0.0.1:18232";
 
 export type Logger = (line: string) => void;
@@ -47,6 +56,7 @@ export async function rpc<T = unknown>(method: string, params: unknown[] = []): 
 }
 
 export async function mine(n: number): Promise<number> {
+  if (TESTNET) throw new Error("mine() is regtest only");
   await rpc("generate", [n]);
   const height = await rpc<number>("getblockcount");
   log(`  mined ${n} block(s), tip ${height}`);
@@ -65,7 +75,7 @@ export function zcashSign(
 ): Promise<{ sighash: string; spends: number }> {
   return new Promise((resolveP, reject) => {
     log(`  $ zcash-sign sign -i ${inPczt.split("/").pop()} -o ${outPczt.split("/").pop()}`);
-    const p = spawn(BIN.zcashSign, ["sign", "-i", inPczt, "-o", outPczt, "-n", "test"], { stdio: ["pipe", "pipe", "pipe"] });
+    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", inPczt, "-o", outPczt, "-n", "test"], { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
     let started = false;
@@ -94,5 +104,7 @@ export function zcashSign(
       }
     });
     p.on("error", reject);
+    // e.g. an unknown consensus branch id: zcash-sign exits before asking for signatures.
+    p.on("close", (code) => { if (!started) reject(new Error(`zcash-sign exited ${code}: ${err}${out}`)); });
   });
 }
