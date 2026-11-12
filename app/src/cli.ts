@@ -7,7 +7,7 @@ import {
   listJobs, release, setup, submitEvidence, walletDir,
 } from "./escrow.ts";
 import { verifyVerdict, type SignedVerdict } from "./verdict.ts";
-import { TESTNET, say } from "./tools.ts";
+import { MAINNET, NETWORK, TESTNET, say } from "./tools.ts";
 
 const ZEC = 100_000_000;
 
@@ -62,7 +62,10 @@ export async function demo() {
  * Each escrow waits for real confirmations, so this takes roughly 15 minutes per path.
  */
 export async function testnet(paths: string[]) {
-  if (!TESTNET) throw new Error("run with ZESCROW_NETWORK=test");
+  if (!TESTNET) throw new Error("run with ZESCROW_NETWORK=test (or =main for real ZEC)");
+  if (MAINNET && process.env.CONFIRM_MAINNET !== "zcash") throw new Error("mainnet spends real ZEC: set CONFIRM_MAINNET=zcash");
+  // Mainnet: a fifth of the testnet amounts (0.02 ZEC for all three paths).
+  const k = MAINNET ? 0.2 : 1;
   const t0 = Date.now();
   await setup();
   const run = Date.now().toString(36);
@@ -70,7 +73,7 @@ export async function testnet(paths: string[]) {
   for (const path of paths) {
     if (path === "B") {
       const doc = Buffer.from("translated-contract.pdf " + run);
-      const b = createJob(`B-${run}`, { name: "Contract translation", bytes: doc, price_zat: 0.1 * ZEC });
+      const b = createJob(`B-${run}`, { name: "Contract translation", bytes: doc, price_zat: Math.round(0.1 * k * ZEC) });
       ids.push(b.id);
       await fund(b.id);
       submitEvidence(b.id, "buyer", "complaint", "deadline passed, nothing delivered", Buffer.from("complaint " + run));
@@ -81,14 +84,14 @@ export async function testnet(paths: string[]) {
       await enforceVerdict(b.id);
     } else if (path === "A") {
       const logo = Buffer.from("logo-pack.zip bytes " + run);
-      const a = createJob(`A-${run}`, { name: "Logo pack (digital goods)", bytes: logo, price_zat: 0.05 * ZEC });
+      const a = createJob(`A-${run}`, { name: "Logo pack (digital goods)", bytes: logo, price_zat: Math.round(0.05 * k * ZEC) });
       ids.push(a.id);
       await fund(a.id);
       submitEvidence(a.id, "seller", "delivery", "sent logo-pack.zip", logo);
       await release(a.id);
     } else if (path === "C") {
       const data = Buffer.from("weather-dataset.csv " + run);
-      const c = createJob(`C-${run}`, { name: "Weather dataset", bytes: data, price_zat: 0.05 * ZEC });
+      const c = createJob(`C-${run}`, { name: "Weather dataset", bytes: data, price_zat: Math.round(0.05 * k * ZEC) });
       ids.push(c.id);
       await fund(c.id);
       submitEvidence(c.id, "seller", "delivery", "sent weather-dataset.csv", data);
@@ -98,7 +101,7 @@ export async function testnet(paths: string[]) {
       await enforceVerdict(c.id);
     } else throw new Error(`unknown path ${path}`);
   }
-  say("== summary (testnet)");
+  say(`== summary (${NETWORK})`);
   for (const j of listJobs().filter((j) => ids.includes(j.id))) {
     say(`  ${j.id.padEnd(12)} ${j.state.padEnd(9)} ${fmt(j.funded_zat ?? 0)}  fund tx ${j.fund_txid} @${j.fund_height}  payout tx ${j.payout_txid} @${j.payout_height}`);
   }
@@ -118,6 +121,7 @@ async function main() {
     case "enforce":
       return void (await enforceVerdict(args[0]));
     case "testnet":
+    case "mainnet":
       return testnet(args.length ? args : ["B", "A", "C"]);
     case "verify": {
       const sv = JSON.parse(readFileSync(args[0], "utf8")) as SignedVerdict;

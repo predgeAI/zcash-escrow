@@ -18,11 +18,17 @@ export const BIN = {
   // which is enough for regtest; testnet runs NU7, so sign there with the NU7 build
   // (scripts/build-deps.sh --testnet). `generate` always uses the pinned build.
   zcashSignPczt: process.env.ZCASH_SIGN_PCZT ??
-    (process.env.ZESCROW_NETWORK === "test" ? `${DEPS}/frost-tools-nu7/target/release/zcash-sign` : process.env.ZCASH_SIGN ?? `${DEPS}/frost-tools/target/release/zcash-sign`),
+    (process.env.ZESCROW_NETWORK === "test" || process.env.ZESCROW_NETWORK === "main" ? `${DEPS}/frost-tools-nu7/target/release/zcash-sign` : process.env.ZCASH_SIGN ?? `${DEPS}/frost-tools/target/release/zcash-sign`),
   frost: process.env.ZESCROW_FROST ?? `${ROOT}/crates/zescrow-frost/target/release/zescrow-frost`,
 };
-export const NETWORK: "regtest" | "test" = process.env.ZESCROW_NETWORK === "test" ? "test" : "regtest";
-export const TESTNET = NETWORK === "test";
+// ZESCROW_NETWORK=main runs the same code on Zcash mainnet with real ZEC (small amounts only).
+export const NETWORK: "regtest" | "test" | "main" =
+  process.env.ZESCROW_NETWORK === "main" ? "main" : process.env.ZESCROW_NETWORK === "test" ? "test" : "regtest";
+/** True on any public network (testnet or mainnet): real blocks, no mining, pre-funded buyer. */
+export const TESTNET = NETWORK !== "regtest";
+export const MAINNET = NETWORK === "main";
+/** Network name for zcash-sign / zcash-devtool (regtest keys are encoded as test, then re-encoded). */
+export const NET = MAINNET ? "main" : "test";
 export const LIGHTWALLETD = process.env.LIGHTWALLETD ?? (TESTNET ? "zecrocks" : "localhost:8137");
 export const ZEBRA_RPC = process.env.ZEBRA_RPC ?? "http://127.0.0.1:18232";
 
@@ -75,7 +81,7 @@ export function zcashSign(
 ): Promise<{ sighash: string; spends: number }> {
   return new Promise((resolveP, reject) => {
     log(`  $ zcash-sign sign -i ${inPczt.split("/").pop()} -o ${outPczt.split("/").pop()}`);
-    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", inPczt, "-o", outPczt, "-n", "test"], { stdio: ["pipe", "pipe", "pipe"] });
+    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", inPczt, "-o", outPczt, "-n", NET], { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
     let started = false;

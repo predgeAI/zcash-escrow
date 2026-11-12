@@ -237,6 +237,22 @@ in total (ZIP 317: 0.00025 for the first deposit, 0.0001 for each other transact
 ZF frost-tools PR #593 already showed 2-of-3 FROST spends of Ironwood notes on public testnet
 (txs `c5a1c4a1…410e`, `23ec9a37…7740`).
 
+## Mainnet
+
+`ZESCROW_NETWORK=main` runs the same three paths on Zcash mainnet with real ZEC, at a fifth of the
+testnet amounts (0.01 + 0.005 + 0.005 ZEC). It is a demonstration of the protocol, not a product:
+key generation is still a trusted dealer and the signer transport is still a local relay.
+
+- wallets use `-n main` and the `zecrocks` lightwalletd; state lives in `.state-mainnet/`;
+- the buyer is a pre-funded wallet in `.mainnet-buyer/` (about 0.025 ZEC in the Ironwood pool;
+  transparent funds can be moved there with `zcash-devtool wallet shield`);
+- signing uses the same NU7 build of `zcash-sign` as testnet;
+- the run refuses to start without `CONFIRM_MAINNET=zcash`.
+
+```bash
+cd app && CONFIRM_MAINNET=zcash npm run mainnet      # or: npm run mainnet -- B
+```
+
 ## Roadmap (proposed ZCG grant, $15,000)
 
 Estimates assume one developer and include review cycles with the FROST maintainers. Each

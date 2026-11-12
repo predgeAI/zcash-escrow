@@ -11,15 +11,15 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { BIN, LIGHTWALLETD, NETWORK, ROOT, TESTNET, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
+import { BIN, LIGHTWALLETD, MAINNET, NET, NETWORK, ROOT, TESTNET, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
 import {
   adjudicate, canonical, loadArbiterKey, sha256, signVerdict, verifyVerdict,
   type Decision, type EvidenceItem, type SignedVerdict, type Terms, type Verdict,
 } from "./verdict.ts";
 
-export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, TESTNET ? ".state-testnet" : ".state");
+export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, MAINNET ? ".state-mainnet" : TESTNET ? ".state-testnet" : ".state");
 // Testnet has no coinbase faucet: the buyer is a wallet funded beforehand (seed age-encrypted inside it).
-const TESTNET_BUYER = process.env.ZESCROW_BUYER_WALLET ?? join(ROOT, ".testnet-buyer");
+const TESTNET_BUYER = process.env.ZESCROW_BUYER_WALLET ?? join(ROOT, MAINNET ? ".mainnet-buyer" : ".testnet-buyer");
 const HEIGHTS = join(ROOT, "chain/activation-heights.toml");
 const COMPOSE = join(ROOT, "chain/compose.yaml");
 const FEE_ALLOWANCE_ZAT = 20_000; // ZIP 317: 2 logical actions x 5,000 zat today, with headroom
@@ -106,13 +106,13 @@ export function partyAddress(p: "buyer" | "seller"): string {
 export async function setup(): Promise<void> {
   say(`== setup: party wallets and arbiter key (${NETWORK})`);
   if (TESTNET && !existsSync(join(walletDir("buyer"), "keys.toml"))) {
-    throw new Error(`testnet buyer wallet missing at ${walletDir("buyer")}; create and fund it first (about 0.1 TAZ)`);
+    throw new Error(`testnet buyer wallet missing at ${walletDir("buyer")}; create and fund it first (${MAINNET ? "about 0.025 ZEC" : "about 0.1 TAZ"})`);
   }
   for (const p of ["buyer", "seller"] as const) {
     if (existsSync(join(walletDir(p), "keys.toml"))) continue;
     mkdirSync(partyDir(p), { recursive: true });
     if (TESTNET) {
-      devtool(["wallet", "-w", walletDir(p), "init", "--name", p, "-i", ageFile(p), "-n", "test", "-s", LIGHTWALLETD]);
+      devtool(["wallet", "-w", walletDir(p), "init", "--name", p, "-i", ageFile(p), "-n", NET, "-s", LIGHTWALLETD]);
       continue;
     }
     devtool(["wallet", "-w", walletDir(p), "init", "--name", p, "-i", ageFile(p), "-n", "regtest",
@@ -171,7 +171,7 @@ async function waitIndexer() {
   throw new Error("light wallet did not catch up with Zebra");
 }
 
-export const fmt = (zat: number) => `${(zat / 1e8).toFixed(8)} ${TESTNET ? "TAZ" : "ZEC"}`;
+export const fmt = (zat: number) => `${(zat / 1e8).toFixed(8)} ${NETWORK === "test" ? "TAZ" : "ZEC"}`;
 
 // ---------- job lifecycle ----------
 
@@ -201,7 +201,7 @@ export function createJob(id: string, item: { name: string; bytes: Buffer; price
   const ak = frost(["ak", "--group", join(jobDir(id), "group.json")]).trim();
   // ZF zcash-sign derives the escrow's full viewing key and address from the group key.
   // It encodes for testnet; on regtest the app re-encodes the same keys with the regtest HRPs.
-  const gen = spawnSync(BIN.zcashSign, ["generate", "--ak", ak, "-n", "test"], { encoding: "utf8" });
+  const gen = spawnSync(BIN.zcashSign, ["generate", "--ak", ak, "-n", NET], { encoding: "utf8" });
   if (gen.status !== 0) throw new Error(gen.stderr);
   const ua = /address: "(\S+)"/.exec(gen.stdout)![1];
   const ufvk = /Viewing Key: "(\S+)"/.exec(gen.stdout)![1];
@@ -267,7 +267,7 @@ function pcztOutputs(pczt: string): PcztOutput[] {
 /** Independently recompute the sighash and randomizers of a PCZT with ZF zcash-sign. */
 function pcztSighash(pczt: string): Promise<{ sighash: string; alphas: string[] }> {
   return new Promise((res, rej) => {
-    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", pczt, "-o", "/dev/null", "-n", "test"]);
+    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", pczt, "-o", "/dev/null", "-n", NET]);
     let out = "";
     p.stdout.on("data", (d) => {
       out += d;

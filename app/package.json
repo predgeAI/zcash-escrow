@@ -7,6 +7,7 @@
   "scripts": {
     "demo": "tsx src/cli.ts demo",
     "testnet": "ZESCROW_NETWORK=test tsx src/cli.ts testnet",
+    "mainnet": "ZESCROW_NETWORK=main tsx src/cli.ts mainnet",
     "cli": "tsx src/cli.ts",
     "ui": "tsx src/server.ts",
     "test": "tsx --test src/*.test.ts",
