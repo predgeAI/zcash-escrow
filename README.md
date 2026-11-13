@@ -246,12 +246,20 @@ key generation is still a trusted dealer and the signer transport is still a loc
 - wallets use `-n main` and the `zecrocks` lightwalletd; state lives in `.state-mainnet/`;
 - the buyer is a pre-funded wallet in `.mainnet-buyer/` (about 0.025 ZEC in the Ironwood pool;
   transparent funds can be moved there with `zcash-devtool wallet shield`);
-- signing uses the same NU7 build of `zcash-sign` as testnet;
+- mainnet is already on NU7 (activation height 3,543,405). The pinned librustzcash rev (`eb38d7a`) has no mainnet
+  NU7 height, so transactions built with it get the wrong consensus branch id and are rejected. Build `zcash-devtool`
+  and `zcash-sign` against a librustzcash checkout with `MainNetwork` NU7 set to `BlockHeight(3_543_405)` (upstream
+  `f53a9b46`) and point the app at them with `ZCASH_DEVTOOL=...` and `ZCASH_SIGN_PCZT=...`;
 - the run refuses to start without `CONFIRM_MAINNET=zcash`.
 
 ```bash
 cd app && CONFIRM_MAINNET=zcash npm run mainnet      # or: npm run mainnet -- B
 ```
+
+**Mainnet run, 13 Nov 2026 (path B, dispute refund):** 0.02 ZEC funded into the escrow
+(tx `97dca221d9a2221e1a5b634fb2aca071c8e5494ed98e54a80f7d2cff51ae2d60`, height 3568796); the arbiter refused a payout
+to the seller that its verdict did not name; buyer + arbiter co-signed the refund
+(tx `50407885adf3b688f30d3a2e8d020297f1adb775dc9b5e2be9e6d50c61fcd5f2`, height 3568807).
 
 ## Roadmap (proposed ZCG grant, $15,000)
 
