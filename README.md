@@ -53,7 +53,7 @@ view-only escrow wallet will spend it, and payments waited from 1 to about 35 bl
 | Escrow address and viewing key | ZF `zcash-sign generate` from the FROST group key. Funds land in **Ironwood**. |
 | Funding | buyer's own `zcash-devtool` wallet, ordinary shielded send. |
 | Payment | `zcash-devtool pczt create-max` → `pczt prove` → ZF `zcash-sign` (sighash + randomizer) → FROST rounds → `zcash-sign` applies the signature → `pczt send`. |
-| Signer policy | before releasing a share, **every** signer opens each PCZT output against its note commitment (`zescrow-frost outputs`, over the `pczt`/`orchard` crates), checks that the outputs pay the agreed address at least the agreed amount and nothing else, and re-derives the sighash from the PCZT with `zcash-sign`. `zescrow-frost sign` refuses a signing package whose message is not that locally derived sighash. |
+| Signer policy | **every** signer releases its share through one `zescrow-frost sign-pczt` call, which reads the PCZT once and, from those bytes (over the `pczt`/`orchard`/`zcash_note_encryption` crates): opens each output against its note commitment; opens the note ciphertext of each output that carries value, so the payee's wallet will see it, and checks that the payee's memo is the expected one (the verdict hash on the arbiter path); requires the fee to be exactly the ZIP 317 conventional fee; checks that the outputs pay the agreed address at least the agreed amount and nothing else; derives the sighash and refuses a signing package whose message is anything else. `zescrow-frost outputs` runs the same checks without signing. |
 | Verdicts | Ed25519-signed canonical JSON: job id, decision, reasons, evidence hashes, exact payment. Anyone can check it offline (`zescrow verify`). The payment memo carries the verdict hash. |
 | Adjudication | **stub rule** for sealed-listing digital goods (below). Real evidence review plugs in at `adjudicate()`. |
 | Signer transport | **stub**: round messages are JSON files relayed by a local coordinator. Milestone 1 moves this to ZF `frostd`. |
@@ -68,7 +68,7 @@ Requirements: Docker, rustup (rustc 1.90+), Node 20.
 ./scripts/chain-up.sh --reset  # Zebra 7.0.0 + Zaino 0.10.2 regtest, NU5..NU6.3 active at height 2
 cd app && npm run demo         # the three escrows above
 npm run ui                     # optional: the same flows in a browser at http://127.0.0.1:4747
-npm test                       # verdict + adjudication unit tests
+npm test                       # verdict, adjudication and PCZT payout-check tests
 ```
 
 Check a verdict by itself:
@@ -110,8 +110,8 @@ buyer wallet ──(shielded send)──▶ escrow address  (FROST group key; 2-
 - **What the chain sees.** One shielded deposit and one shielded payment, both v6 Ironwood
   transactions. FROST signatures look like single-signer RedPallas signatures.
 - **Verdict ↔ transaction binding.** The verdict names the payment address and minimum
-  amount. The arbiter signs only if the PCZT's outputs match it and the FROST message equals
-  the sighash it computed itself. It records `{verdict_sha256, sighash}`, and the payment memo
+  amount. The arbiter signs only if the PCZT's outputs match it, the payment memo carries the
+  verdict hash, and the FROST message equals the sighash it computed itself. It records `{verdict_sha256, sighash}`, and the payment memo
   carries the verdict hash, so the recipient can link the two.
 
 ### Verdict format (`predge.zescrow.verdict/1`)
@@ -163,8 +163,9 @@ peer-to-peer messaging, transaction delivery, share backup, and recovery.
 
 **Transaction delivery.**
 - The PCZT is built from a view-only wallet and proven once. Every signer re-checks it
-  independently: outputs opened against their note commitments, then a sighash recomputed
-  with `zcash-sign`, which the FROST signing package must carry.
+  independently, from a single read of the file: outputs opened against their note
+  commitments and ciphertexts, memo, ZIP 317 fee, then the sighash, which the FROST signing
+  package must carry.
 - Broadcast is a plain `SendTransaction` to any lightwalletd/Zaino, so whoever finishes
   aggregation can broadcast.
 - The payment memo carries the verdict hash for the recipient.
@@ -284,9 +285,9 @@ Two design commitments:
 
 ```
 chain/            regtest compose file (Zebra 7.0.0 + Zaino 0.10.2), configs, activation heights
-crates/zescrow-frost/  per-party FROST CLI over ZF reddsa / frost-rerandomized, PCZT output check over pczt / orchard (no crypto of its own)
+crates/zescrow-frost/  per-party FROST CLI over ZF reddsa / frost-rerandomized, PCZT checks over pczt / orchard (no crypto of its own)
 app/src/escrow.ts      protocol: jobs, funding, PCZT spend, signer checks, verdict enforcement
-app/src/payout-check.ts  signer policy over the commitment-verified PCZT outputs
+app/src/payout-check.ts  wrappers for the signer's PCZT check and check-and-sign
 app/src/verdict.ts     verdict schema, Ed25519 signing, adjudication rule
 app/src/cli.ts         demo + verify; app/src/server.ts + app/ui: demo UI
 scripts/          build-deps.sh (pinned upstream tools), chain-up.sh, zcash-sign-nu7.patch (testnet signing)
