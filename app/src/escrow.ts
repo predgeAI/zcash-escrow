@@ -11,6 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { payoutRefusal, verifiedOutputs } from "./payout-check.ts";
 import { BIN, LIGHTWALLETD, MAINNET, NET, NETWORK, ROOT, TESTNET, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
 import {
   adjudicate, canonical, loadArbiterKey, sha256, signVerdict, verifyVerdict,
@@ -256,14 +257,6 @@ export async function fund(id: string): Promise<Job> {
 
 // ---------- payout: PCZT + 2-of-3 FROST ----------
 
-interface PcztOutput { value: number; to?: string }
-
-/** Parse non-dummy outputs from `zcash-devtool pczt inspect`. */
-function pcztOutputs(pczt: string): PcztOutput[] {
-  const txt = devtool(["pczt", "inspect", pczt], { quiet: true });
-  return [...txt.matchAll(/Output: (\d+) zatoshis(?: to (\S+))?/g)].map((m) => ({ value: Number(m[1]), to: m[2] }));
-}
-
 /** Independently recompute the sighash and randomizers of a PCZT with ZF zcash-sign. */
 function pcztSighash(pczt: string): Promise<{ sighash: string; alphas: string[] }> {
   return new Promise((res, rej) => {
@@ -281,17 +274,23 @@ function pcztSighash(pczt: string): Promise<{ sighash: string; alphas: string[] 
 }
 
 /**
- * Each signer's own check before releasing a FROST share: the PCZT must pay `expect.to` at least
- * `expect.min` and nothing to anyone else; the message must be that PCZT's real sighash.
+ * Each signer's own check before releasing a FROST share: every output of the PCZT must open
+ * against its note commitment, pay `expect.to` at least `expect.min` and nothing to anyone else;
+ * the message must be that PCZT's real sighash. Returns the sighash this signer derived itself,
+ * which `zescrow-frost sign` then requires the signing package to carry.
  */
-async function approve(party: Party, pczt: string, expect: { to: string; min: number }, message: string, alpha: string) {
-  const outs = pcztOutputs(pczt).filter((o) => o.value > 0);
-  const paid = outs.filter((o) => o.to === expect.to).reduce((s, o) => s + o.value, 0);
-  const others = outs.filter((o) => o.to !== expect.to);
-  if (paid < expect.min) throw new Error(`${party} refuses: PCZT pays ${paid} zat to the agreed address, expected >= ${expect.min}`);
-  if (others.length) throw new Error(`${party} refuses: PCZT has outputs to other addresses`);
+async function approve(party: Party, pczt: string, expect: { to: string; min: number }, message: string, alpha: string): Promise<string> {
+  let outs;
+  try {
+    outs = verifiedOutputs(pczt, expect.to);
+  } catch (e) {
+    throw new Error(`${party} refuses: PCZT outputs cannot be verified against their note commitments: ${(e as Error).message}`);
+  }
+  const refusal = payoutRefusal(outs, expect);
+  if (refusal) throw new Error(`${party} refuses: ${refusal}`);
   const own = await pcztSighash(pczt);
   if (own.sighash !== message || !own.alphas.includes(alpha)) throw new Error(`${party} refuses: message is not this PCZT's sighash`);
+  return own.sighash;
 }
 
 async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect: { to: string; min: number },
@@ -313,10 +312,11 @@ async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect
       frost(["package", "--message", sighash, "--commitments", ...signers.map((p) => join(dir, `${p}-${r.index}.commit.json`)), "--out", pkg]);
       // Round 2: each signer checks the transaction itself, then signs.
       for (const p of signers) {
-        await approve(p, pczt, expect, sighash, r.alpha);
-        if (p === "arbiter") arbiterGate?.(sighash);
+        const own = await approve(p, pczt, expect, sighash, r.alpha);
+        if (p === "arbiter") arbiterGate?.(own);
+        // The share is bound to the sighash this signer derived: `sign` refuses a package with any other message.
         frost(["sign", "--key", shareFile(p, job.id), "--nonces", join(partyDir(p), "nonces", `${job.id}-${r.index}.json`),
-          "--package", pkg, "--randomizer", r.alpha, "--out", join(dir, `${p}-${r.index}.share.json`)]);
+          "--package", pkg, "--randomizer", r.alpha, "--expected-message", own, "--out", join(dir, `${p}-${r.index}.share.json`)]);
         say(`  ${p} checked the PCZT and produced a signature share`);
       }
       sigs.push(frost(["aggregate", "--group", group, "--package", pkg, "--randomizer", r.alpha,
