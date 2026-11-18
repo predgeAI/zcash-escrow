@@ -18,3 +18,7 @@ hex = "0.4"
 rand = "0.8.5"
 clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
+# PCZT parsing and Orchard/Ironwood note-commitment checks, on the same librustzcash rev and
+# orchard version that zcash-devtool (scripts/build-deps.sh) builds the PCZTs with.
+pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818", features = ["orchard"] }
+orchard = { version = "0.16", default-features = false, features = ["std"] }
