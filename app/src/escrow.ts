@@ -9,9 +9,9 @@
 // Network: regtest by default; ZESCROW_NETWORK=test runs on the public testnet (see tools.ts).
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { payoutRefusal, verifiedOutputs } from "./payout-check.ts";
+import { checkPayout, signPayout, type Expect } from "./payout-check.ts";
 import { BIN, LIGHTWALLETD, MAINNET, NET, NETWORK, ROOT, TESTNET, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
 import {
   adjudicate, canonical, loadArbiterKey, sha256, signVerdict, verifyVerdict,
@@ -23,7 +23,9 @@ export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, MAINNET ? ".state-m
 const TESTNET_BUYER = process.env.ZESCROW_BUYER_WALLET ?? join(ROOT, MAINNET ? ".mainnet-buyer" : ".testnet-buyer");
 const HEIGHTS = join(ROOT, "chain/activation-heights.toml");
 const COMPOSE = join(ROOT, "chain/compose.yaml");
-const FEE_ALLOWANCE_ZAT = 20_000; // ZIP 317: 2 logical actions x 5,000 zat today, with headroom
+// Funding headroom and the verdict's minimum payout. The fee itself is not taken on trust: every
+// signer requires it to be exactly the ZIP 317 conventional fee (2 actions x 5,000 zat today).
+const FEE_ALLOWANCE_ZAT = 20_000;
 
 type Party = "buyer" | "seller" | "arbiter";
 const partyDir = (p: Party) => join(STATE, "parties", p);
@@ -257,43 +259,7 @@ export async function fund(id: string): Promise<Job> {
 
 // ---------- payout: PCZT + 2-of-3 FROST ----------
 
-/** Independently recompute the sighash and randomizers of a PCZT with ZF zcash-sign. */
-function pcztSighash(pczt: string): Promise<{ sighash: string; alphas: string[] }> {
-  return new Promise((res, rej) => {
-    const p = spawn(BIN.zcashSignPczt, ["sign", "-i", pczt, "-o", "/dev/null", "-n", NET]);
-    let out = "";
-    p.stdout.on("data", (d) => {
-      out += d;
-      if (out.includes("Input hex-encoded signature")) {
-        p.kill();
-        res({ sighash: /SIGHASH: ([0-9a-f]{64})/.exec(out)![1], alphas: [...out.matchAll(/Randomizer #\d+ \(\w+\): ([0-9a-f]{64})/g)].map((m) => m[1]) });
-      }
-    });
-    p.on("close", () => { if (!out.includes("Input hex")) rej(new Error(`zcash-sign: ${out}`)); });
-  });
-}
-
-/**
- * Each signer's own check before releasing a FROST share: every output of the PCZT must open
- * against its note commitment, pay `expect.to` at least `expect.min` and nothing to anyone else;
- * the message must be that PCZT's real sighash. Returns the sighash this signer derived itself,
- * which `zescrow-frost sign` then requires the signing package to carry.
- */
-async function approve(party: Party, pczt: string, expect: { to: string; min: number }, message: string, alpha: string): Promise<string> {
-  let outs;
-  try {
-    outs = verifiedOutputs(pczt, expect.to);
-  } catch (e) {
-    throw new Error(`${party} refuses: PCZT outputs cannot be verified against their note commitments: ${(e as Error).message}`);
-  }
-  const refusal = payoutRefusal(outs, expect);
-  if (refusal) throw new Error(`${party} refuses: ${refusal}`);
-  const own = await pcztSighash(pczt);
-  if (own.sighash !== message || !own.alphas.includes(alpha)) throw new Error(`${party} refuses: message is not this PCZT's sighash`);
-  return own.sighash;
-}
-
-async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect: { to: string; min: number },
+async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect: Expect,
   arbiterGate?: (sighash: string) => void): Promise<string> {
   const dir = join(jobDir(job.id), "rounds");
   mkdirSync(dir, { recursive: true });
@@ -310,14 +276,21 @@ async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect
       }
       const pkg = join(dir, `package-${r.index}.json`);
       frost(["package", "--message", sighash, "--commitments", ...signers.map((p) => join(dir, `${p}-${r.index}.commit.json`)), "--out", pkg]);
-      // Round 2: each signer checks the transaction itself, then signs.
+      // Round 2: each signer checks the PCZT and signs in one `zescrow-frost sign-pczt` call, which
+      // reads the PCZT once, checks outputs (commitments, ciphertexts, memo), fee and payout, derives
+      // the sighash from those bytes and refuses a package with any other message.
       for (const p of signers) {
-        const own = await approve(p, pczt, expect, sighash, r.alpha);
-        if (p === "arbiter") arbiterGate?.(own);
-        // The share is bound to the sighash this signer derived: `sign` refuses a package with any other message.
-        frost(["sign", "--key", shareFile(p, job.id), "--nonces", join(partyDir(p), "nonces", `${job.id}-${r.index}.json`),
-          "--package", pkg, "--randomizer", r.alpha, "--expected-message", own, "--out", join(dir, `${p}-${r.index}.share.json`)]);
-        say(`  ${p} checked the PCZT and produced a signature share`);
+        let own;
+        try {
+          own = signPayout(pczt, expect, {
+            key: shareFile(p, job.id), nonces: join(partyDir(p), "nonces", `${job.id}-${r.index}.json`),
+            package: pkg, randomizer: r.alpha, out: join(dir, `${p}-${r.index}.share.json`),
+          });
+        } catch (e) {
+          throw new Error(`${p} refuses: ${(e as Error).message}`);
+        }
+        if (p === "arbiter") arbiterGate?.(own.sighash);
+        say(`  ${p} checked the PCZT (fee ${own.fee} zat, memo verified) and produced a signature share`);
       }
       sigs.push(frost(["aggregate", "--group", group, "--package", pkg, "--randomizer", r.alpha,
         "--shares", ...signers.map((p) => join(dir, `${p}-${r.index}.share.json`))]).trim());
@@ -338,7 +311,7 @@ async function payout(job: Job, to: string, memo: string, signers: [Party, Party
   const t0 = Date.now();
   devtool(["pczt", "-w", w, "prove", pczt, "--output", proven]);
   say(`  Halo 2 proof built in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-  const signed = await frostSign(job, signers, proven, { to, min: (job.funded_zat ?? job.terms.price_zat) - FEE_ALLOWANCE_ZAT }, arbiterGate);
+  const signed = await frostSign(job, signers, proven, { to, min: (job.funded_zat ?? job.terms.price_zat) - FEE_ALLOWANCE_ZAT, memo }, arbiterGate);
   const out = devtool(["pczt", "-w", w, "send", "-s", LIGHTWALLETD, signed]);
   const txid = out.trim().split("\n").pop()!;
   let height: number | undefined;
@@ -422,7 +395,8 @@ export async function enforceVerdict(id: string): Promise<Job> {
   if (sv.verdict.job_id !== id || sv.verdict.escrow_address !== job.escrow_address) throw new Error("verdict is for another escrow");
   const vhash = sha256(canonical(sv));
   say(`== job ${id}: ${sv.verdict.cosigner_with} + arbiter co-sign the payout named in the verdict`);
-  // The arbiter's gate: it signs only for this verdict's payout (approve() checks outputs + sighash).
+  // The arbiter signs only this verdict's payout: `sign-pczt` checks payee, amount, fee and that the
+  // payout memo carries this verdict's hash. The gate records what it signed.
   const gate = (sighash: string) => {
     writeJson(join(jobDir(id), "arbiter-cosign.json"), { verdict_sha256: vhash, sighash, at: new Date().toISOString() });
   };
@@ -444,9 +418,11 @@ export function arbiterRefusesWrongPayout(id: string): Promise<string> {
   const pczt = join(jobDir(id), "wrong.pczt");
   devtool(["pczt", "-w", w, "create-max", "--address", wrong, "--output", pczt], { quiet: true });
   devtool(["pczt", "-w", w, "prove", pczt, "--output", pczt + ".proven"], { quiet: true });
-  return approve("arbiter", pczt + ".proven", { to: sv.verdict.payout.to, min: sv.verdict.payout.min_amount_zat }, "", "")
+  const vhash = sha256(canonical(sv));
+  return Promise.resolve()
+    .then(() => checkPayout(pczt + ".proven", { to: sv.verdict.payout.to, min: sv.verdict.payout.min_amount_zat, memo: `zescrow verdict ${vhash.slice(0, 32)}` }))
     .then(() => "arbiter signed (unexpected)")
-    .catch((e: Error) => e.message);
+    .catch((e: Error) => `arbiter refuses: ${e.message}`);
 }
 
 export type { Decision };

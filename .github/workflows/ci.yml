@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/zescrow-frost
+
+      - name: cargo fmt
+        working-directory: crates/zescrow-frost
+        run: cargo fmt --check
+
+      - name: cargo build (release binary used by the app tests)
+        working-directory: crates/zescrow-frost
+        run: cargo build --release --locked
+
+      - name: cargo clippy
+        working-directory: crates/zescrow-frost
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: crates/zescrow-frost
+        run: cargo test --release --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      - name: typecheck
+        working-directory: app
+        run: npm run typecheck
+
+      # CI=true is set by GitHub Actions: the tests against the zescrow-frost binary fail
+      # instead of skipping if the binary is missing.
+      - name: npm test
+        working-directory: app
+        run: npm test

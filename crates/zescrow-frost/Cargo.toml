@@ -20,5 +20,8 @@ clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
 # PCZT parsing and Orchard/Ironwood note-commitment checks, on the same librustzcash rev and
 # orchard version that zcash-devtool (scripts/build-deps.sh) builds the PCZTs with.
-pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818", features = ["orchard"] }
+pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "eb38d7a373661179dbc083a2fd58b3a6c9b25818", features = ["orchard", "signer"] }
 orchard = { version = "0.16", default-features = false, features = ["std"] }
+# Output recovery from the note itself (esk, pk_d), and the alpha encoding; the versions orchard 0.16 uses.
+zcash_note_encryption = "0.5.1"
+ff = { version = "0.14", default-features = false }
