@@ -103,10 +103,11 @@ buyer wallet ──(shielded send)──▶ escrow address  (FROST group key; 2-
 
 - **Per-job keys.** Every escrow gets its own FROST group and its own address. A share is
   only worth anything for the lifetime of one deal.
-- **What the arbiter sees.** It never gets a viewing key. During a dispute it sees the
-  evidence the parties choose to send (it stores only hashes in the verdict), and the PCZT it
-  is asked to co-sign. The PCZT shows the escrowed amount and the payment output. It shows
-  nothing about the parties' other funds.
+- **What the arbiter sees.** Like every party, it stores the escrow's viewing key (see
+  "Share backup" below), so it sees the deposit, any memo, the balance and the payment out, even
+  when there is no dispute. During a dispute it also sees the evidence the parties choose to
+  send (it stores only hashes in the verdict) and the PCZT it is asked to co-sign. It sees
+  nothing about the parties' other funds, because each escrow uses a new address.
 - **What the chain sees.** One shielded deposit and one shielded payment, both v6 Ironwood
   transactions. FROST signatures look like single-signer RedPallas signatures.
 - **Verdict ↔ transaction binding.** The verdict names the payment address and minimum
