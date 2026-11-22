@@ -1,9 +1,14 @@
 # Shielded 2-of-3 escrow for P2P commerce on Zcash
 
+> **Trusted-dealer testnet demo.** Key shares come from a trusted dealer, signer messages go
+> through a stub local relay, and the arbiter is run by Predge. Every party, the arbiter
+> included, holds the escrow's full viewing key. Not for real funds.
+
 A buyer pays into a shielded address that nobody controls alone. The buyer, the seller and a
 neutral arbiter each hold one FROST share of that address's spend key. Any two can pay out:
 
-- **Deal goes fine:** buyer + seller sign, the seller is paid. The arbiter never hears about it.
+- **Deal goes fine:** buyer + seller sign, the seller is paid. The arbiter never has to sign (it
+  still sees the deposit and the payment through the escrow's viewing key).
 - **Dispute:** both sides send evidence to the arbiter. The arbiter publishes a signed verdict
   and co-signs **only** the payment that verdict names, together with the winning party.
 - **The arbiter cannot move funds by itself**, and it has no wallet and no seed. It holds one
