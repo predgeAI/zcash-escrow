@@ -73,7 +73,7 @@ Requirements: Docker, rustup (rustc 1.90+), Node 20.
 ./scripts/chain-up.sh --reset  # Zebra 7.0.0 + Zaino 0.10.2 regtest, NU5..NU6.3 active at height 2
 cd app && npm run demo         # the three escrows above
 npm run ui                     # optional: the same flows in a browser at http://127.0.0.1:4747
-npm test                       # verdict, adjudication and PCZT payout-check tests
+npm test                       # verdict, adjudication, PCZT payout-check, deal state machine and quote tests
 ```
 
 Check a verdict by itself:
@@ -206,6 +206,48 @@ This rule is deliberately simple. It shows the shape of the system; it does not 
 disputes. For example, it cannot prove the file was actually *sent* to the buyer. Real
 disputes go through Predge's evidence review, which produces the same signed verdict object.
 The signing path does not change.
+
+## Marketplace mode (staged payouts, fiat terms)
+
+For a P2P marketplace whose payment provider holds funds custodially today. Its requirements
+include: obligations in fiat, a 95% / 4% / 1% split paid at different times, a review reward
+that can come after the seller payout, a negative review that freezes the seller's unpaid share,
+full refunds that do not keep the fee, holds during disputes, and payout addresses known only
+later. Full mapping, including what is **not** met: [`docs/marketplace-mode.md`](docs/marketplace-mode.md).
+
+- **Who holds shares:** 2-of-3 of the marketplace operator, a policy co-signer (signs only stages
+  its own replica of the deal state machine allows) and an independent arbiter (disputes). Predge
+  does not need a share. Key generation is still a trusted dealer in this demo.
+- **Staged payouts from one escrow:** each stage spends the escrow and sends the rest back to the
+  escrow group's own internal address. Signers accept change only there
+  (`zescrow-frost sign-pczt --change-to-group <escrow UFVK> --change-exact <zat>`), and only if
+  that UFVK belongs to their own FROST group. Change sent anywhere else is refused.
+- **Signed stage instructions** (`predge.zescrow.verdict/3`, kind `stage`): deal, stage id,
+  transition, quote, payments, reserve top-up, network fee, exact change. Each stage id signs once.
+- **PriceLock without holding fiat:** each stage pays fiat / price from an Ed25519-signed median
+  quote. A surplus goes to the marketplace reserve in the same transaction; a shortfall is a
+  recorded top-up paid from the reserve. We do not convert to fiat, and the price risk stays with
+  the marketplace's reserve, as it does with a PSP today.
+
+**Public testnet, 24.11.2026 (path M, deal `M-mwutpicz`, log in `testnet-run-M-marketplace.log`):**
+a $2.00 deal funded at $40/ZEC with 5,045,000 zat (0.05 TAZ + 45,000 zat network fee budget).
+Signers are operator + policy co-signer; the arbiter never had to sign.
+
+| Step | Tx (height) | Outputs |
+|---|---|---|
+| Fund | `d7c14a48e7590a3409d5f43807211c34029b7a124fccbd9b743c60af1bdfb099` (4660876) | escrow 5,045,000 |
+| Seller payout before delivery | (no tx) | refused: "seller share is locked" |
+| Stage 1, seller 95% at $44 | `c2627753cb184e783080f689014b7e482b2d135f59def3cac6831bd0e37af193` (4660889) | seller 4,318,181 ($1.90), reserve 431,819 (surplus), **change 280,000 back to the escrow's internal address**, fee 15,000 |
+| Same stage, remainder sent to the marketplace instead | (no tx) | refused by the policy co-signer: "PCZT has outputs to other addresses" |
+| Replay of stage 1 | (no tx) | refused: "already executed: replay refused" |
+| Negative review after the seller payout | (event) | nothing frozen or reversed; reward claimable |
+| Stage 2, reward 4% at $38 | `2e9d7c94d20400e92a843601f19b94406c10c6c9a8f1ae30ff828fac583b2341` (4660893) | buyer 200,000 (whole tranche), change 70,000, fee 10,000; reserve owes 10,526 |
+| Stage 3, fee 1% at $40 | `916fda290edd5d0f5286098f4c2a182d9e71d623868d5b1768c54dc9667db44e` (4660896) | marketplace 50,000 ($0.02), reserve 5,000 (unused budget), fee 15,000; **escrow empty** |
+| Reserve top-up to the buyer | `81e9a1c0270dfa7c973890876ac364c937420259a9445be59d129afa4e45d6d1` | 10,526 from the reserve wallet (ordinary send) |
+
+The run was resumed once on the same funded escrow after a fix to the last stage's fee (the wallet
+always adds a zero-value change output); both parts are in the log. Stage 1 and the diverted PCZT
+are test fixtures (`testnet-stage-change`, `testnet-stage-diverted`) for the Rust and npm tests.
 
 ## Answers to the committee's FROST questions
 
@@ -355,6 +397,10 @@ crates/zescrow-frost/  per-party FROST CLI over ZF reddsa / frost-rerandomized, 
 app/src/escrow.ts      protocol: jobs, funding, PCZT spend, signer checks, verdict enforcement
 app/src/payout-check.ts  wrappers for the signer's PCZT check and check-and-sign
 app/src/verdict.ts     verdict schema (/1, /2), Ed25519 signing, adjudication rule, marketplace fee split
+app/src/deal.ts        marketplace mode: fiat deal state machine, signed events, stage instructions (/3), signer check
+app/src/pricelock.ts   signed ZEC/USD quotes, fiat -> zat
+app/src/marketplace.ts marketplace mode on a real escrow: staged payouts with change back to the group (testnet path M)
+docs/marketplace-mode.md  requirements mapping, trust model, formats
 app/src/cli.ts         demo + verify; app/src/server.ts + app/ui: demo UI
 scripts/          build-deps.sh (pinned upstream tools), chain-up.sh, zcash-sign-nu7.patch (testnet signing),
                   zcash-devtool-payment-uri.patch (multi-output PCZTs for the marketplace fee)
