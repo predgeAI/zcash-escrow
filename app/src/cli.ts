@@ -6,7 +6,9 @@ import {
   STATE, arbiterRefusesWrongPayout, balance, createJob, enforceVerdict, ensureMarketplaceWallet, fmt, fund, issueVerdict,
   listJobs, release, setup, signersRefuseMissingFee, submitEvidence, walletDir,
 } from "./escrow.ts";
-import { verdictPayments, verifyVerdict, type SignedVerdict } from "./verdict.ts";
+import { verdictPayments, verifyCanonical, verifyVerdict, type SignedVerdict } from "./verdict.ts";
+import { marketplaceScenario } from "./marketplace.ts";
+import type { SignedStage } from "./deal.ts";
 import { MAINNET, NETWORK, TESTNET, say } from "./tools.ts";
 
 const ZEC = 100_000_000;
@@ -103,6 +105,10 @@ export async function testnet(paths: string[]) {
       say("  try: ask the signers to release everything to the seller, skipping the marketplace fee");
       say(`  -> ${await signersRefuseMissingFee(a.id)}`);
       await release(a.id);
+    } else if (path === "M") {
+      // Marketplace mode: staged payouts with change back to the escrow, fiat terms, PriceLock.
+      if (MAINNET) throw new Error("path M runs on testnet only");
+      await marketplaceScenario({ fixtures: process.env.ZESCROW_FIXTURES, resume: process.env.ZESCROW_RESUME });
     } else if (path === "C") {
       const data = Buffer.from("weather-dataset.csv " + run);
       const c = createJob(`C-${run}`, { name: "Weather dataset", bytes: data, price_zat: Math.round(0.05 * k * ZEC) });
@@ -139,7 +145,17 @@ async function main() {
     case "mainnet":
       return testnet(args.length ? args : ["B", "A", "C"]);
     case "verify": {
-      const sv = JSON.parse(readFileSync(args[0], "utf8")) as SignedVerdict;
+      const parsed = JSON.parse(readFileSync(args[0], "utf8")) as SignedVerdict | SignedStage;
+      if ("instruction" in parsed) {
+        // A marketplace stage instruction (predge.zescrow.verdict/3): signature and contents.
+        const ins = parsed.instruction;
+        const ok = verifyCanonical(ins, parsed.signature, args[1] ?? ins.issuer_pubkey) && (!args[1] || ins.issuer_pubkey === args[1]);
+        console.log(ok
+          ? `valid stage (${ins.schema}): ${ins.stage_id} ${ins.transition.event} signed by the ${ins.issuer}; pays ${ins.payments.map((p) => `${p.party} ${p.zat}`).join(", ")} zat; change ${ins.change?.zat ?? 0}; memo "${ins.memo}"`
+          : "INVALID stage instruction");
+        process.exit(ok ? 0 : 1);
+      }
+      const sv = parsed;
       const ok = verifyVerdict(sv, args[1]);
       const pays = ok ? verdictPayments(sv.verdict).map((p) => `${p.party} ${p.min_amount_zat}${p.max_amount_zat !== undefined && p.max_amount_zat !== p.min_amount_zat ? `..${p.max_amount_zat}` : ""} zat`).join(", ") : "";
       console.log(ok ? `valid verdict (${sv.verdict.schema}): ${sv.verdict.decision} for ${sv.verdict.job_id}, pay ${pays}` : "INVALID verdict");
@@ -149,7 +165,7 @@ async function main() {
       for (const j of listJobs()) console.log(`${j.id}\t${j.state}\t${j.escrow_address.slice(0, 24)}…\t${j.payout_txid ?? ""}`);
       return;
     default:
-      console.log("usage: zescrow demo | testnet [B A C AF] | release <job> | enforce <job> | setup | status | verify <verdict.json> [arbiter_pubkey_hex]");
+      console.log("usage: zescrow demo | testnet [B A C AF M] | release <job> | enforce <job> | setup | status | verify <verdict.json> [arbiter_pubkey_hex]");
   }
 }
 

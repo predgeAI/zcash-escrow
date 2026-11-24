@@ -30,6 +30,10 @@ enum Cmd {
     Keygen {
         #[arg(long)]
         out: PathBuf,
+        /// The three share holders, in identifier order. Default: buyer,seller,arbiter. Marketplace
+        /// mode uses operator,policy,arbiter.
+        #[arg(long, value_delimiter = ',', default_value = "buyer,seller,arbiter")]
+        parties: Vec<String>,
     },
     /// Print the group verifying key (Orchard/Ironwood `ak`) as hex.
     Ak {
@@ -95,6 +99,21 @@ enum Cmd {
         /// marketplace fee). Repeatable.
         #[arg(long)]
         exact: Vec<String>,
+        /// Staged payout: the escrow's own UFVK. Change is accepted only to an address of this
+        /// key's internal (change) scope, and the key's `ak` must be the FROST group key. Without
+        /// it, any output to the escrow counts as an output to another address and is refused.
+        #[arg(long)]
+        change_to_group: Option<String>,
+        /// Exact change, zat, that must go back to the group's internal address.
+        #[arg(long, requires = "change_to_group", conflicts_with = "change_min")]
+        change_exact: Option<u64>,
+        /// Minimum change, zat, that must go back to the group's internal address.
+        #[arg(long, requires = "change_to_group")]
+        change_min: Option<u64>,
+        /// The FROST group key (hex) the change UFVK must belong to. `sign-pczt` takes it from
+        /// the signer's key package instead.
+        #[arg(long, requires = "change_to_group")]
+        group_ak: Option<String>,
     },
     /// Round 2 from the PCZT itself: read the PCZT once, run every `outputs` check on it, derive
     /// the sighash from those same bytes, and produce this party's signature share only if the
@@ -113,6 +132,17 @@ enum Cmd {
         memo: Option<String>,
         #[arg(long)]
         exact: Vec<String>,
+        /// Staged payout: the escrow's own UFVK. Change is accepted only to an address of this
+        /// key's internal (change) scope, and the key's `ak` must be the FROST group key. Without
+        /// it, any output to the escrow counts as an output to another address and is refused.
+        #[arg(long)]
+        change_to_group: Option<String>,
+        /// Exact change, zat, that must go back to the group's internal address.
+        #[arg(long, requires = "change_to_group", conflicts_with = "change_min")]
+        change_exact: Option<u64>,
+        /// Minimum change, zat, that must go back to the group's internal address.
+        #[arg(long, requires = "change_to_group")]
+        change_min: Option<u64>,
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
@@ -173,8 +203,6 @@ struct Share {
     identifier: rp::Identifier,
     share: rp::round2::SignatureShare,
 }
-
-const PARTIES: [&str; 3] = ["buyer", "seller", "arbiter"];
 
 fn read_json<T: for<'de> Deserialize<'de>>(p: &PathBuf) -> Result<T> {
     let s = fs::read_to_string(p).wrap_err_with(|| format!("reading {}", p.display()))?;
@@ -240,6 +268,9 @@ struct VerifiedOutput {
     to_expected: bool,
     /// Index into the policy's exact payments (e.g. a marketplace fee) that this output pays.
     exact_payment: Option<usize>,
+    /// Whether this output is change back to the escrow group's own internal address (only
+    /// recognised when the policy names the group's UFVK with `--change-to-group`).
+    to_group: bool,
     /// The memo the recipient will read, for an output that carries value: its text, `""` when
     /// empty, or null when it is not a text memo. Null for zero-value outputs (not opened).
     memo: Option<String>,
@@ -258,6 +289,75 @@ struct Policy {
     /// Further payments that must each be made exactly: Orchard receiver and zat (e.g. a
     /// marketplace fee). Their outputs' ciphertexts must open like any paying output's.
     exact: Vec<([u8; 43], u64)>,
+    /// Staged payout: what may go back to the escrow group itself as change.
+    change: Option<ChangePolicy>,
+}
+
+/// How much change a staged payout must send back to the escrow.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ChangeAmount {
+    Exact(u64),
+    Min(u64),
+}
+
+/// Change to the escrow group: only to an address of the group's internal (change) scope.
+struct ChangePolicy {
+    /// Internal-scope incoming viewing key of the escrow's Orchard FVK (Ironwood uses the same keys).
+    internal: orchard::keys::IncomingViewingKey,
+    /// External-scope incoming viewing key: payments must not go to the escrow's own address.
+    external: orchard::keys::IncomingViewingKey,
+    /// The FVK's spend validating key `ak`, which must be the FROST group verifying key.
+    ak: [u8; 32],
+    amount: ChangeAmount,
+}
+
+impl ChangePolicy {
+    fn from_ufvk(ufvk: &str, amount: ChangeAmount) -> Result<Self> {
+        use orchard::keys::Scope;
+        use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
+        let (_, u) =
+            Ufvk::decode(ufvk.trim()).map_err(|e| eyre!("--change-to-group: not a UFVK: {e}"))?;
+        let raw = u
+            .items()
+            .into_iter()
+            .find_map(|f| match f {
+                Fvk::Orchard(b) => Some(b),
+                _ => None,
+            })
+            .ok_or_else(|| eyre!("--change-to-group: UFVK has no Orchard key"))?;
+        let fvk = orchard::keys::FullViewingKey::from_bytes(&raw)
+            .ok_or_else(|| eyre!("--change-to-group: invalid Orchard full viewing key"))?;
+        let mut ak = [0u8; 32];
+        ak.copy_from_slice(&raw[..32]);
+        Ok(ChangePolicy {
+            internal: fvk.to_ivk(Scope::Internal),
+            external: fvk.to_ivk(Scope::External),
+            ak,
+            amount,
+        })
+    }
+
+    /// Change goes only to an address that decrypts with the group's internal-scope IVK.
+    fn is_change(&self, addr: &orchard::Address) -> bool {
+        self.internal.diversifier_index(addr).is_some()
+    }
+
+    /// Any address of the group, either scope.
+    fn is_group(&self, addr: &orchard::Address) -> bool {
+        self.is_change(addr) || self.external.diversifier_index(addr).is_some()
+    }
+
+    /// The change UFVK must belong to the FROST group that signs.
+    fn check_group_ak(&self, group_ak: &[u8]) -> Result<()> {
+        if group_ak != self.ak {
+            return Err(eyre!(
+                "refusing: change UFVK has ak {}, not this FROST group's key {}",
+                hex::encode(self.ak),
+                hex::encode(group_ak)
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The result of checking a PCZT: its verified outputs, the fee it pays, and the sighash and
@@ -426,6 +526,9 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
             let receiver = recipient.to_raw_address_bytes();
             let to_expected = receiver == policy.to;
             let exact_payment = policy.exact.iter().position(|(r, _)| *r == receiver);
+            let to_group = !to_expected
+                && exact_payment.is_none()
+                && policy.change.as_ref().is_some_and(|c| c.is_change(recipient));
             // A zero-value output (padding) has a random ciphertext by design; one that
             // carries value must open, or its recipient's wallet never sees the note.
             let memo = if value.inner() > 0 {
@@ -463,6 +566,7 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
                 receiver: hex::encode(receiver),
                 to_expected,
                 exact_payment,
+                to_group,
                 memo,
             });
         }
@@ -513,8 +617,27 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
             return Err(eyre!("PCZT pays {paid} zat to the agreed address, expected <= {max}"));
         }
     }
-    if outs.iter().any(|o| !o.to_expected && o.exact_payment.is_none() && o.value > 0) {
+    if outs
+        .iter()
+        .any(|o| !o.to_expected && o.exact_payment.is_none() && !o.to_group && o.value > 0)
+    {
         return Err(eyre!("PCZT has outputs to other addresses"));
+    }
+    if let Some(c) = &policy.change {
+        let change: u64 = outs.iter().filter(|o| o.to_group).map(|o| o.value).sum();
+        match c.amount {
+            ChangeAmount::Exact(want) if change != want => {
+                return Err(eyre!(
+                    "PCZT sends {change} zat of change to the escrow group, expected exactly {want}"
+                ));
+            }
+            ChangeAmount::Min(want) if change < want => {
+                return Err(eyre!(
+                    "PCZT sends {change} zat of change to the escrow group, expected >= {want}"
+                ));
+            }
+            _ => {}
+        }
     }
 
     let signer = pczt::roles::signer::Signer::new(pczt)
@@ -531,7 +654,7 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
 /// The single-payee policy (tests; the CLI goes through `policy_with`).
 #[cfg(test)]
 fn policy(to: &str, min: u64, memo: Option<&str>) -> Result<Policy> {
-    policy_with(to, min, None, memo, &[])
+    policy_with(to, min, None, memo, &[], None)
 }
 
 /// The policy with an upper bound for the payee and exact further payments (`<ua>:<zat>`).
@@ -541,6 +664,7 @@ fn policy_with(
     max: Option<u64>,
     memo: Option<&str>,
     exact: &[String],
+    change: Option<ChangePolicy>,
 ) -> Result<Policy> {
     let to = orchard_receiver(to)?;
     let mut parsed: Vec<([u8; 43], u64)> = Vec::new();
@@ -560,7 +684,37 @@ fn policy_with(
     if max.is_some_and(|m| m < min) {
         return Err(eyre!("--max is below --min"));
     }
-    Ok(Policy { to, min, max, memo: memo.map(text_memo).transpose()?, exact: parsed })
+    if let Some(c) = &change {
+        for r in std::iter::once(&to).chain(parsed.iter().map(|(r, _)| r)) {
+            let addr = Option::from(orchard::Address::from_raw_address_bytes(r))
+                .ok_or_else(|| eyre!("payment address has an invalid Orchard receiver"))?;
+            if c.is_group(&addr) {
+                return Err(eyre!(
+                    "a payment names the escrow group's own address; only change may go there"
+                ));
+            }
+        }
+    }
+    Ok(Policy { to, min, max, memo: memo.map(text_memo).transpose()?, exact: parsed, change })
+}
+
+/// The change part of the policy from the CLI flags.
+fn change_policy(
+    ufvk: Option<&str>,
+    exact: Option<u64>,
+    min: Option<u64>,
+) -> Result<Option<ChangePolicy>> {
+    let Some(ufvk) = ufvk else { return Ok(None) };
+    let amount = match (exact, min) {
+        (Some(z), None) => ChangeAmount::Exact(z),
+        (None, Some(z)) => ChangeAmount::Min(z),
+        _ => {
+            return Err(eyre!(
+                "--change-to-group needs exactly one of --change-exact or --change-min"
+            ))
+        }
+    };
+    ChangePolicy::from_ufvk(ufvk, amount).map(Some)
 }
 
 /// Check a PCZT (see `check_pczt`) and sign its sighash, all from one byte buffer.
@@ -572,6 +726,10 @@ fn sign_pczt(
     key: &rp::keys::KeyPackage,
     randomizer_hex: &str,
 ) -> Result<(Checked, rp::round2::SignatureShare)> {
+    if let Some(c) = &policy.change {
+        let ak = key.verifying_key().serialize().map_err(|e| eyre!("{e:?}"))?;
+        c.check_group_ak(&ak)?;
+    }
     let checked = check_pczt(pczt_bytes, policy)?;
     let alpha = randomizer_hex.trim().to_ascii_lowercase();
     if !checked.alphas.contains(&alpha) {
@@ -586,7 +744,10 @@ fn sign_pczt(
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Keygen { out } => {
+        Cmd::Keygen { out, parties: names } => {
+            if names.len() != 3 || names.iter().any(|n| n.is_empty() || n.contains(['/', '.'])) {
+                return Err(eyre!("--parties wants three plain names"));
+            }
             let (shares, pubkeys) = rp::keys::generate_with_dealer(
                 3,
                 2,
@@ -595,7 +756,7 @@ fn main() -> Result<()> {
             )
             .map_err(|e| eyre!("{e:?}"))?;
             let mut parties = BTreeMap::new();
-            for ((id, share), name) in shares.into_iter().zip(PARTIES) {
+            for ((id, share), name) in shares.into_iter().zip(names.iter().map(String::as_str)) {
                 // KeyPackage::try_from runs the VSS check of the share against its commitment.
                 let key_package =
                     rp::keys::KeyPackage::try_from(share).map_err(|e| eyre!("{e:?}"))?;
@@ -648,10 +809,25 @@ fn main() -> Result<()> {
             write_json(&out, &Share { identifier: k.identifier, share })?;
             println!("{} signed message {}", k.party, hex::encode(pkg.message()));
         }
-        Cmd::Outputs { pczt, to, min, max, memo, exact } => {
+        Cmd::Outputs {
+            pczt,
+            to,
+            min,
+            max,
+            memo,
+            exact,
+            change_to_group,
+            change_exact,
+            change_min,
+            group_ak,
+        } => {
             let bytes = fs::read(&pczt).wrap_err_with(|| format!("reading {}", pczt.display()))?;
+            let change = change_policy(change_to_group.as_deref(), change_exact, change_min)?;
+            if let (Some(c), Some(ak)) = (&change, group_ak) {
+                c.check_group_ak(&hex::decode(ak.trim())?)?;
+            }
             let checked =
-                check_pczt(&bytes, &policy_with(&to, min, max, memo.as_deref(), &exact)?)?;
+                check_pczt(&bytes, &policy_with(&to, min, max, memo.as_deref(), &exact, change)?)?;
             println!("{}", serde_json::to_string(&checked)?);
         }
         Cmd::SignPczt {
@@ -661,6 +837,9 @@ fn main() -> Result<()> {
             max,
             memo,
             exact,
+            change_to_group,
+            change_exact,
+            change_min,
             key,
             nonces,
             package,
@@ -676,7 +855,14 @@ fn main() -> Result<()> {
             let bytes = fs::read(&pczt).wrap_err_with(|| format!("reading {}", pczt.display()))?;
             let (checked, share) = sign_pczt(
                 &bytes,
-                &policy_with(&to, min, max, memo.as_deref(), &exact)?,
+                &policy_with(
+                    &to,
+                    min,
+                    max,
+                    memo.as_deref(),
+                    &exact,
+                    change_policy(change_to_group.as_deref(), change_exact, change_min)?,
+                )?,
                 &pkg,
                 &n,
                 &k.key_package,
@@ -1131,6 +1317,7 @@ mod tests {
             Some(4_875_000),
             memo,
             &[format!("{MARKETPLACE}:{exact_zat}")],
+            None,
         )
     }
 
@@ -1184,12 +1371,13 @@ mod tests {
             Some(4_875_000),
             None,
             &[format!("{TESTNET_BUYER}:125000")],
+            None,
         )
         .unwrap();
         let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
         assert!(err.contains("pays 0 zat to the marketplace fee address"), "{err}");
         // Without any fee in the policy, the fee output is an output to another address.
-        let p = policy_with(TESTNET_SELLER, 4_855_000, None, None, &[]).unwrap();
+        let p = policy_with(TESTNET_SELLER, 4_855_000, None, None, &[], None).unwrap();
         let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
         assert!(err.contains("outputs to other addresses"), "{err}");
     }
@@ -1202,6 +1390,7 @@ mod tests {
             Some(4_859_999),
             None,
             &[format!("{MARKETPLACE}:125000")],
+            None,
         )
         .unwrap();
         let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
@@ -1210,20 +1399,23 @@ mod tests {
 
     #[test]
     fn fee_policy_rejects_duplicate_or_malformed_payments() {
-        assert!(
-            policy_with(TESTNET_SELLER, 0, None, None, &[format!("{TESTNET_SELLER}:1")]).is_err()
-        );
+        assert!(policy_with(TESTNET_SELLER, 0, None, None, &[format!("{TESTNET_SELLER}:1")], None)
+            .is_err());
         assert!(policy_with(
             TESTNET_SELLER,
             0,
             None,
             None,
-            &[format!("{MARKETPLACE}:1"), format!("{MARKETPLACE}:2")]
+            &[format!("{MARKETPLACE}:1"), format!("{MARKETPLACE}:2")],
+            None,
         )
         .is_err());
-        assert!(policy_with(TESTNET_SELLER, 0, None, None, &[MARKETPLACE.to_string()]).is_err());
-        assert!(policy_with(TESTNET_SELLER, 0, None, None, &[format!("{MARKETPLACE}:0")]).is_err());
-        assert!(policy_with(TESTNET_SELLER, 10, Some(9), None, &[]).is_err());
+        assert!(
+            policy_with(TESTNET_SELLER, 0, None, None, &[MARKETPLACE.to_string()], None).is_err()
+        );
+        assert!(policy_with(TESTNET_SELLER, 0, None, None, &[format!("{MARKETPLACE}:0")], None)
+            .is_err());
+        assert!(policy_with(TESTNET_SELLER, 10, Some(9), None, &[], None).is_err());
     }
 
     #[test]
@@ -1244,5 +1436,204 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("marketplace fee address"), "{err}");
+    }
+
+    // ---- staged payouts: change only to the escrow group's own internal address ----
+
+    /// A fresh Orchard key pair standing in for an escrow group: its FVK and UFVK (testnet).
+    fn group_key(seed: u8) -> (orchard::keys::FullViewingKey, String) {
+        use zcash_address::unified::{Encoding, Fvk, Ufvk};
+        let sk = (0u8..=255)
+            .find_map(|i| -> Option<orchard::keys::SpendingKey> {
+                Option::from(orchard::keys::SpendingKey::from_bytes([seed ^ i; 32]))
+            })
+            .unwrap();
+        let fvk = orchard::keys::FullViewingKey::from(&sk);
+        let ufvk = Ufvk::try_from_items(vec![Fvk::Orchard(fvk.to_bytes())])
+            .unwrap()
+            .encode(&zcash_protocol::consensus::NetworkType::Test);
+        (fvk, ufvk)
+    }
+
+    fn ua_of(addr: &orchard::Address) -> String {
+        use zcash_address::unified::{Address, Encoding, Receiver};
+        Address::try_from_items(vec![Receiver::Orchard(addr.to_raw_address_bytes())])
+            .unwrap()
+            .encode(&zcash_protocol::consensus::NetworkType::Test)
+    }
+
+    #[test]
+    fn change_is_recognised_only_at_the_groups_internal_scope() {
+        use orchard::keys::Scope;
+        let (fvk, ufvk) = group_key(1);
+        let (other, _) = group_key(2);
+        let c = ChangePolicy::from_ufvk(&ufvk, ChangeAmount::Exact(1)).unwrap();
+        for j in [0u32, 1, 7] {
+            assert!(c.is_change(&fvk.address_at(j, Scope::Internal)), "internal {j}");
+            // The group's own external address is not change: a stage may not "pay" the escrow.
+            assert!(!c.is_change(&fvk.address_at(j, Scope::External)), "external {j}");
+            assert!(c.is_group(&fvk.address_at(j, Scope::External)));
+            // Another key's change address is not this group's change.
+            assert!(!c.is_change(&other.address_at(j, Scope::Internal)), "other {j}");
+            assert!(!c.is_group(&other.address_at(j, Scope::External)));
+        }
+    }
+
+    #[test]
+    fn change_ufvk_must_be_the_signing_groups_key() {
+        let (fvk, ufvk) = group_key(3);
+        let c = ChangePolicy::from_ufvk(&ufvk, ChangeAmount::Min(0)).unwrap();
+        c.check_group_ak(&fvk.to_bytes()[..32]).unwrap();
+        let err = c.check_group_ak(&[0x11; 32]).unwrap_err().to_string();
+        assert!(err.contains("not this FROST group's key"), "{err}");
+        assert!(ChangePolicy::from_ufvk("not-a-ufvk", ChangeAmount::Min(0)).is_err());
+    }
+
+    #[test]
+    fn sign_pczt_refuses_a_change_key_of_another_group() {
+        // The FROST round's group key is not the change UFVK's ak: refused before any PCZT check.
+        let r = round(&hex::decode(FEE_SIGHASH).unwrap());
+        let (id, kp) = r.keys.iter().next().unwrap();
+        let (_, ufvk) = group_key(4);
+        let mut pol = fee_pol(125_000, Some(FEE_MEMO)).unwrap();
+        pol.change = Some(ChangePolicy::from_ufvk(&ufvk, ChangeAmount::Exact(0)).unwrap());
+        let err = sign_pczt(FEE_RELEASE, &pol, &r.pkg, &r.nonces[id], kp, FEE_ALPHA)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not this FROST group's key"), "{err}");
+    }
+
+    #[test]
+    fn change_policy_flags_and_payments_to_the_group_are_refused() {
+        use orchard::keys::Scope;
+        let (fvk, ufvk) = group_key(5);
+        assert!(change_policy(Some(&ufvk), None, None).is_err());
+        assert!(change_policy(Some(&ufvk), Some(1), Some(1)).is_err());
+        assert!(change_policy(None, None, None).unwrap().is_none());
+        // A payment (not change) to either of the group's own addresses is refused up front.
+        for scope in [Scope::External, Scope::Internal] {
+            let own = ua_of(&fvk.address_at(0u32, scope));
+            let c = change_policy(Some(&ufvk), Some(0), None).unwrap();
+            let err = policy_with(&own, 1, None, None, &[], c).err().unwrap().to_string();
+            assert!(err.contains("escrow group's own address"), "{err}");
+            let c = change_policy(Some(&ufvk), Some(0), None).unwrap();
+            let err = policy_with(TESTNET_SELLER, 1, None, None, &[format!("{own}:5")], c)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("escrow group's own address"), "{err}");
+        }
+    }
+
+    #[test]
+    fn change_amount_is_enforced_and_other_outputs_are_not_change() {
+        // The AF payout has no change: the change policy holds with exactly 0 and fails a minimum.
+        let (_, ufvk) = group_key(6);
+        let with = |amount| {
+            let mut p = fee_pol(125_000, Some(FEE_MEMO)).unwrap();
+            p.change = Some(ChangePolicy::from_ufvk(&ufvk, amount).unwrap());
+            p
+        };
+        let c = check_pczt(FEE_RELEASE, &with(ChangeAmount::Exact(0))).unwrap();
+        assert!(c.outputs.iter().all(|o| !o.to_group));
+        let err = check_pczt(FEE_RELEASE, &with(ChangeAmount::Min(1))).unwrap_err().to_string();
+        assert!(err.contains("sends 0 zat of change to the escrow group, expected >= 1"), "{err}");
+        let err = check_pczt(FEE_RELEASE, &with(ChangeAmount::Exact(10))).unwrap_err().to_string();
+        assert!(err.contains("expected exactly 10"), "{err}");
+        // A change policy does not make an unnamed recipient acceptable: the marketplace output
+        // is not the group's change, so without its exact payment it is refused.
+        let mut p = policy_with(TESTNET_SELLER, 4_855_000, None, None, &[], None).unwrap();
+        p.change = Some(ChangePolicy::from_ufvk(&ufvk, ChangeAmount::Min(0)).unwrap());
+        let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
+        assert!(err.contains("outputs to other addresses"), "{err}");
+    }
+
+    // ---- a real staged payout from public testnet (path M, stage 1) ----
+
+    /// Stage 1 of testnet deal M-mwutpicz: seller 4_318_181, reserve 431_819 (surplus), change
+    /// 280_000 back to the escrow's internal address, ZIP 317 fee 15_000 (3 actions).
+    const STAGE: &[u8] = include_bytes!("../tests/fixtures/testnet-stage-change.proven.pczt");
+    /// The same stage built with the remainder (275_000) paid to the marketplace's fee address
+    /// instead of back to the escrow (one more output, so 20_000 fee).
+    const STAGE_DIVERTED: &[u8] =
+        include_bytes!("../tests/fixtures/testnet-stage-diverted.proven.pczt");
+    const STAGE_UFVK: &str = "uviewtest10hzn9jvakhmy9g9cj20hk70nh9ag6c979qygzfz4szkw9t646s5r8xqztph20ktsyde65ryvmepeattend5e60r9g25xaezp4qt49dtsx97wzxnetnwvja2dfdppcs9mfwydjjgknng8axhmexcaufnewcs0pal42dq8768vq8ds2akn7qdceks0lm8sx";
+    const STAGE_AK: &str = "ad137afd46427f569102c6345611e25398e6a8d44e92f256fb43ec36e7cde22f";
+    const STAGE_RESERVE: &str = "utest103cv9dfmfqhkv8ptjlwmmyh84prafu3ktam8uva43sqckszt8jmdcafctrlx634sxaa2ucc5790t7q997juc2zje3ynxv6p7hqwvurq7";
+    const STAGE_MEMO: &str = "zescrow stage c468cd78052dd02a5ca26f3d4a2c407d";
+    const STAGE_SIGHASH: &str = "93f17ae3d01b83c6caf3de595f132d2b487e4b0189f68030784e18cb537762c2";
+
+    fn stage_pol(ufvk: Option<&str>, amount: ChangeAmount) -> Policy {
+        let change = ufvk.map(|u| ChangePolicy::from_ufvk(u, amount).unwrap());
+        policy_with(
+            TESTNET_SELLER,
+            4_318_181,
+            Some(4_318_181),
+            Some(STAGE_MEMO),
+            &[format!("{STAGE_RESERVE}:431819")],
+            change,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn staged_payout_with_change_to_the_group_passes_every_check() {
+        let c =
+            check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000))).unwrap();
+        assert_eq!((c.fee, c.actions), (15_000, 3));
+        assert_eq!(c.sighash, STAGE_SIGHASH);
+        let change: Vec<_> = c.outputs.iter().filter(|o| o.to_group).collect();
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].value, 280_000);
+        // The change ciphertext opened too: the escrow's own wallet sees its change note.
+        assert!(change[0].memo.is_some());
+        let ufvk = ChangePolicy::from_ufvk(STAGE_UFVK, ChangeAmount::Min(0)).unwrap();
+        ufvk.check_group_ak(&hex::decode(STAGE_AK).unwrap()).unwrap();
+        check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Min(280_000))).unwrap();
+    }
+
+    #[test]
+    fn staged_payout_change_amount_must_match() {
+        for amount in
+            [ChangeAmount::Exact(279_999), ChangeAmount::Exact(280_001), ChangeAmount::Min(280_001)]
+        {
+            let err =
+                check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), amount)).unwrap_err().to_string();
+            assert!(err.contains("sends 280000 zat of change to the escrow group"), "{err}");
+        }
+    }
+
+    #[test]
+    fn change_anywhere_but_the_signing_groups_internal_address_is_refused() {
+        // No change policy: the escrow's own change output is an output to another address.
+        let err = check_pczt(STAGE, &stage_pol(None, ChangeAmount::Exact(0))).unwrap_err();
+        assert!(err.to_string().contains("outputs to other addresses"), "{err}");
+        // Another group's UFVK: the same output is not its change.
+        let (_, other) = group_key(7);
+        let err =
+            check_pczt(STAGE, &stage_pol(Some(&other), ChangeAmount::Exact(280_000))).unwrap_err();
+        assert!(err.to_string().contains("outputs to other addresses"), "{err}");
+        // The remainder paid to the marketplace instead of back to the escrow.
+        let err =
+            check_pczt(STAGE_DIVERTED, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000)))
+                .unwrap_err();
+        assert!(err.to_string().contains("outputs to other addresses"), "{err}");
+        // Even with the right UFVK, a signer whose FROST group is another one refuses.
+        let r = round(&hex::decode(STAGE_SIGHASH).unwrap());
+        let (id, kp) = r.keys.iter().next().unwrap();
+        let alpha = check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000)))
+            .unwrap()
+            .alphas[0]
+            .clone();
+        let err = sign_pczt(
+            STAGE,
+            &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000)),
+            &r.pkg,
+            &r.nonces[id],
+            kp,
+            &alpha,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not this FROST group's key"), "{err}");
     }
 }

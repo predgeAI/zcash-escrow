@@ -78,3 +78,25 @@ test("a payout without the fee output is refused", { skip }, () => {
 test("a fee output with another amount is refused", { skip }, () => {
   assert.throws(() => checkPayout(FEE_RELEASE, feeExpect(124_999)), /pays 125000 zat to the marketplace fee address, expected exactly 124999/);
 });
+
+// Marketplace mode, testnet deal M-mwutpicz stage 1: change back to the escrow's internal address.
+const STAGE = join(FIXTURES, "testnet-stage-change.proven.pczt");
+const STAGE_DIVERTED = join(FIXTURES, "testnet-stage-diverted.proven.pczt");
+const STAGE_UFVK = "uviewtest10hzn9jvakhmy9g9cj20hk70nh9ag6c979qygzfz4szkw9t646s5r8xqztph20ktsyde65ryvmepeattend5e60r9g25xaezp4qt49dtsx97wzxnetnwvja2dfdppcs9mfwydjjgknng8axhmexcaufnewcs0pal42dq8768vq8ds2akn7qdceks0lm8sx";
+const STAGE_AK = "ad137afd46427f569102c6345611e25398e6a8d44e92f256fb43ec36e7cde22f";
+const stageExpect = (change?: { ufvk: string; exact: number }) => ({
+  to: "utest197jhccyr9h55qx8603krk2ju9zvgnjstuj2uy0x9fsrm9jntdmxrdccl9syffa93d9csf7wew6czml70mryudvetjttza7vuusqckzuz",
+  min: 4_318_181, max: 4_318_181, memo: "zescrow stage c468cd78052dd02a5ca26f3d4a2c407d",
+  exact: [{ to: "utest103cv9dfmfqhkv8ptjlwmmyh84prafu3ktam8uva43sqckszt8jmdcafctrlx634sxaa2ucc5790t7q997juc2zje3ynxv6p7hqwvurq7", zat: 431_819 }],
+  change,
+});
+
+test("a staged payout passes only with its exact change to the escrow group", { skip }, () => {
+  const c = checkPayout(STAGE, stageExpect({ ufvk: STAGE_UFVK, exact: 280_000 }), STAGE_AK);
+  assert.deepEqual(c.outputs.filter((o) => o.to_group).map((o) => o.value), [280_000]);
+  assert.equal(c.fee, 15_000);
+  assert.throws(() => checkPayout(STAGE, stageExpect({ ufvk: STAGE_UFVK, exact: 279_999 }), STAGE_AK), /expected exactly 279999/);
+  assert.throws(() => checkPayout(STAGE, stageExpect()), /outputs to other addresses/);
+  assert.throws(() => checkPayout(STAGE, stageExpect({ ufvk: STAGE_UFVK, exact: 280_000 }), "00".repeat(32)), /not this FROST group's key/);
+  assert.throws(() => checkPayout(STAGE_DIVERTED, stageExpect({ ufvk: STAGE_UFVK, exact: 280_000 }), STAGE_AK), /outputs to other addresses/);
+});
