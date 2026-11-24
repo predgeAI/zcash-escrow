@@ -221,4 +221,4 @@ A $2.00 deal is funded at $40/ZEC: 0.05 TAZ plus a 45,000 zat budget, so 5,045,0
    no change. The escrow is empty.
 7. The reserve pays the 10,526 zat top-up to the buyer.
 
-The transaction ids are in the README and in `testnet-run-M-marketplace.log`.
+The transaction ids of the 24.11.2026 run are in the README.

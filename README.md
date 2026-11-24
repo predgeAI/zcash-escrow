@@ -229,7 +229,7 @@ later. Full mapping, including what is **not** met: [`docs/marketplace-mode.md`]
   recorded top-up paid from the reserve. We do not convert to fiat, and the price risk stays with
   the marketplace's reserve, as it does with a PSP today.
 
-**Public testnet, 24.11.2026 (path M, deal `M-mwutpicz`, log in `testnet-run-M-marketplace.log`):**
+**Public testnet, 24.11.2026 (path M, deal `M-mwutpicz`):**
 a $2.00 deal funded at $40/ZEC with 5,045,000 zat (0.05 TAZ + 45,000 zat network fee budget).
 Signers are operator + policy co-signer; the arbiter never had to sign.
 
@@ -246,7 +246,7 @@ Signers are operator + policy co-signer; the arbiter never had to sign.
 | Reserve top-up to the buyer | `81e9a1c0270dfa7c973890876ac364c937420259a9445be59d129afa4e45d6d1` | 10,526 from the reserve wallet (ordinary send) |
 
 The run was resumed once on the same funded escrow after a fix to the last stage's fee (the wallet
-always adds a zero-value change output); both parts are in the log. Stage 1 and the diverted PCZT
+always adds a zero-value change output). Stage 1 and the diverted PCZT
 are test fixtures (`testnet-stage-change`, `testnet-stage-diverted`) for the Rust and npm tests.
 
 ## Answers to the committee's FROST questions
