@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Marketplace fee. Deal terms take an optional `marketplace_fee` (`bps` rounded down or
+  `fixed_zat`, and `on_refund: keep | return`). The payout then has two outputs, the winner and
+  the fee address, and no change. `zescrow-frost outputs` / `sign-pczt` take `--exact
+  <address>:<zat>` (an exact payment) and `--max`, and run every existing check on the fee
+  output too (commitment, ciphertext, ZIP 317 fee over all actions). A PCZT that drops or alters
+  the fee is refused. Verdict schema `predge.zescrow.verdict/2` (`payments` list) for fee deals;
+  `/1` is unchanged for deals without a fee. `scripts/zcash-devtool-payment-uri.patch` lets
+  `pczt create` take a ZIP 321 request. Run on public testnet (path AF).
+
 ### Security
 
 Three further signer-side gaps, reported by @danielgorgonha (DeegaLabs) in a review of the

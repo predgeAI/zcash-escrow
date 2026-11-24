@@ -85,9 +85,16 @@ enum Cmd {
         /// Minimum the payee must receive, zat.
         #[arg(long, default_value_t = 0)]
         min: u64,
+        /// Maximum the payee may receive, zat.
+        #[arg(long)]
+        max: Option<u64>,
         /// Memo every output to the payee must carry (e.g. the verdict hash), as text.
         #[arg(long)]
         memo: Option<String>,
+        /// A further payment that must be made exactly, `<unified address>:<zat>` (e.g. a
+        /// marketplace fee). Repeatable.
+        #[arg(long)]
+        exact: Vec<String>,
     },
     /// Round 2 from the PCZT itself: read the PCZT once, run every `outputs` check on it, derive
     /// the sighash from those same bytes, and produce this party's signature share only if the
@@ -101,7 +108,11 @@ enum Cmd {
         #[arg(long)]
         min: u64,
         #[arg(long)]
+        max: Option<u64>,
+        #[arg(long)]
         memo: Option<String>,
+        #[arg(long)]
+        exact: Vec<String>,
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
@@ -227,6 +238,8 @@ struct VerifiedOutput {
     /// Raw 43-byte Orchard receiver, hex.
     receiver: String,
     to_expected: bool,
+    /// Index into the policy's exact payments (e.g. a marketplace fee) that this output pays.
+    exact_payment: Option<usize>,
     /// The memo the recipient will read, for an output that carries value: its text, `""` when
     /// empty, or null when it is not a text memo. Null for zero-value outputs (not opened).
     memo: Option<String>,
@@ -238,8 +251,13 @@ struct Policy {
     to: [u8; 43],
     /// At least this much must reach `to`.
     min: u64,
+    /// When set, at most this much may reach `to`.
+    max: Option<u64>,
     /// When set, every output that pays `to` must carry exactly this memo (ZIP 302 encoding).
     memo: Option<[u8; 512]>,
+    /// Further payments that must each be made exactly: Orchard receiver and zat (e.g. a
+    /// marketplace fee). Their outputs' ciphertexts must open like any paying output's.
+    exact: Vec<([u8; 43], u64)>,
 }
 
 /// The result of checking a PCZT: its verified outputs, the fee it pays, and the sighash and
@@ -407,6 +425,7 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
             };
             let receiver = recipient.to_raw_address_bytes();
             let to_expected = receiver == policy.to;
+            let exact_payment = policy.exact.iter().position(|(r, _)| *r == receiver);
             // A zero-value output (padding) has a random ciphertext by design; one that
             // carries value must open, or its recipient's wallet never sees the note.
             let memo = if value.inner() > 0 {
@@ -443,6 +462,7 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
                 value: value.inner(),
                 receiver: hex::encode(receiver),
                 to_expected,
+                exact_payment,
                 memo,
             });
         }
@@ -471,7 +491,16 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
     let fee = fee_rule(&stats)?;
     let actions: u64 = stats.iter().map(|s| s.actions).sum();
 
-    // Payout policy, on the verified outputs.
+    // Payout policy, on the verified outputs. Exact payments first, so a missing or altered
+    // marketplace fee is reported as such.
+    for (k, (_, want)) in policy.exact.iter().enumerate() {
+        let paid: u64 = outs.iter().filter(|o| o.exact_payment == Some(k)).map(|o| o.value).sum();
+        if paid != *want {
+            return Err(eyre!(
+                "PCZT pays {paid} zat to the marketplace fee address, expected exactly {want}"
+            ));
+        }
+    }
     let paid: u64 = outs.iter().filter(|o| o.to_expected).map(|o| o.value).sum();
     if paid < policy.min {
         return Err(eyre!(
@@ -479,7 +508,12 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
             policy.min
         ));
     }
-    if outs.iter().any(|o| !o.to_expected && o.value > 0) {
+    if let Some(max) = policy.max {
+        if paid > max {
+            return Err(eyre!("PCZT pays {paid} zat to the agreed address, expected <= {max}"));
+        }
+    }
+    if outs.iter().any(|o| !o.to_expected && o.exact_payment.is_none() && o.value > 0) {
         return Err(eyre!("PCZT has outputs to other addresses"));
     }
 
@@ -494,9 +528,39 @@ fn check_pczt(pczt_bytes: &[u8], policy: &Policy) -> Result<Checked> {
     })
 }
 
-/// The policy from command-line values.
+/// The single-payee policy (tests; the CLI goes through `policy_with`).
+#[cfg(test)]
 fn policy(to: &str, min: u64, memo: Option<&str>) -> Result<Policy> {
-    Ok(Policy { to: orchard_receiver(to)?, min, memo: memo.map(text_memo).transpose()? })
+    policy_with(to, min, None, memo, &[])
+}
+
+/// The policy with an upper bound for the payee and exact further payments (`<ua>:<zat>`).
+fn policy_with(
+    to: &str,
+    min: u64,
+    max: Option<u64>,
+    memo: Option<&str>,
+    exact: &[String],
+) -> Result<Policy> {
+    let to = orchard_receiver(to)?;
+    let mut parsed: Vec<([u8; 43], u64)> = Vec::new();
+    for e in exact {
+        let (ua, zat) =
+            e.rsplit_once(':').ok_or_else(|| eyre!("--exact wants <address>:<zat>, got {e}"))?;
+        let r = orchard_receiver(ua)?;
+        let zat: u64 = zat.parse().map_err(|_| eyre!("--exact: bad amount in {e}"))?;
+        if zat == 0 {
+            return Err(eyre!("--exact: a zero payment has no output to check"));
+        }
+        if r == to || parsed.iter().any(|(p, _)| *p == r) {
+            return Err(eyre!("payments name the same address twice"));
+        }
+        parsed.push((r, zat));
+    }
+    if max.is_some_and(|m| m < min) {
+        return Err(eyre!("--max is below --min"));
+    }
+    Ok(Policy { to, min, max, memo: memo.map(text_memo).transpose()?, exact: parsed })
 }
 
 /// Check a PCZT (see `check_pczt`) and sign its sighash, all from one byte buffer.
@@ -584,12 +648,25 @@ fn main() -> Result<()> {
             write_json(&out, &Share { identifier: k.identifier, share })?;
             println!("{} signed message {}", k.party, hex::encode(pkg.message()));
         }
-        Cmd::Outputs { pczt, to, min, memo } => {
+        Cmd::Outputs { pczt, to, min, max, memo, exact } => {
             let bytes = fs::read(&pczt).wrap_err_with(|| format!("reading {}", pczt.display()))?;
-            let checked = check_pczt(&bytes, &policy(&to, min, memo.as_deref())?)?;
+            let checked =
+                check_pczt(&bytes, &policy_with(&to, min, max, memo.as_deref(), &exact)?)?;
             println!("{}", serde_json::to_string(&checked)?);
         }
-        Cmd::SignPczt { pczt, to, min, memo, key, nonces, package, randomizer: r, out } => {
+        Cmd::SignPczt {
+            pczt,
+            to,
+            min,
+            max,
+            memo,
+            exact,
+            key,
+            nonces,
+            package,
+            randomizer: r,
+            out,
+        } => {
             let k: PartyKey = read_json(&key)?;
             let n: rp::round1::SigningNonces = read_json(&nonces)?;
             // Nonces are single-use: remove them before anything else can reuse them.
@@ -599,7 +676,7 @@ fn main() -> Result<()> {
             let bytes = fs::read(&pczt).wrap_err_with(|| format!("reading {}", pczt.display()))?;
             let (checked, share) = sign_pczt(
                 &bytes,
-                &policy(&to, min, memo.as_deref())?,
+                &policy_with(&to, min, max, memo.as_deref(), &exact)?,
                 &pkg,
                 &n,
                 &k.key_package,
@@ -1031,5 +1108,141 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("is not the expected memo"), "{err}");
+    }
+
+    // ---- marketplace fee: two paying outputs (seller + fee address), checked exactly ----
+
+    /// Testnet run AF (24.11.2026, tx 939b8ec1…8564): 0.05 TAZ escrow, 250 bps fee. One spend,
+    /// three Ironwood actions: 4_860_000 zat to the seller, 125_000 to the marketplace, fee 15_000.
+    const FEE_RELEASE: &[u8] = include_bytes!("../tests/fixtures/testnet-fee-release.proven.pczt");
+    /// Same escrow: a release paying everything to the seller, with no fee output (refused there).
+    const FEE_MISSING: &[u8] = include_bytes!("../tests/fixtures/testnet-fee-missing.proven.pczt");
+    const MARKETPLACE: &str = "utest1dpdrfv009asg0yh0vjmw7wptx0lx8dz4zzhj5yn6z5kzw08yge6922npfswvm06gzl2t4fzds00dzj5pcexeunqdnadpfq5cz56ykxct";
+    const FEE_MEMO: &str = "zescrow release AF-mwurzoyy";
+    const FEE_SIGHASH: &str = "6485ea427932807121919b8d42e054752c02987823b0961f57a80238c18e9b93";
+    const FEE_ALPHA: &str = "f29a8aa6d1a33141b954ca12cf57685ac8bb07a8b3e36c33ba5efd2a5802de20";
+
+    /// The policy the buyer and seller sign the AF release under: seller within the fee
+    /// allowance of the rest, marketplace exactly 125_000.
+    fn fee_pol(exact_zat: u64, memo: Option<&str>) -> Result<Policy> {
+        policy_with(
+            TESTNET_SELLER,
+            4_855_000,
+            Some(4_875_000),
+            memo,
+            &[format!("{MARKETPLACE}:{exact_zat}")],
+        )
+    }
+
+    #[test]
+    fn two_output_fee_payout_passes_every_check() {
+        let c = check_pczt(FEE_RELEASE, &fee_pol(125_000, Some(FEE_MEMO)).unwrap()).unwrap();
+        assert_eq!((c.fee, c.actions), (15_000, 3));
+        assert_eq!(c.sighash, FEE_SIGHASH);
+        assert!(c.alphas.contains(&FEE_ALPHA.to_string()));
+        let seller: Vec<_> = c.outputs.iter().filter(|o| o.to_expected).collect();
+        let fee: Vec<_> = c.outputs.iter().filter(|o| o.exact_payment == Some(0)).collect();
+        assert_eq!(seller.len(), 1);
+        assert_eq!((seller[0].value, seller[0].memo.as_deref()), (4_860_000, Some(FEE_MEMO)));
+        assert_eq!(fee.len(), 1);
+        assert_eq!(fee[0].value, 125_000);
+        // The fee output's ciphertext opened too: the marketplace's wallet sees its note.
+        assert_eq!(fee[0].memo.as_deref(), Some("zescrow release AF-mwurzoyy marketplace fee"));
+    }
+
+    #[test]
+    fn missing_fee_output_is_refused() {
+        let err =
+            check_pczt(FEE_MISSING, &fee_pol(125_000, None).unwrap()).unwrap_err().to_string();
+        assert!(
+            err.contains("pays 0 zat to the marketplace fee address, expected exactly 125000"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fee_output_with_another_amount_is_refused() {
+        for want in [124_999, 125_001, 250_000] {
+            let err = check_pczt(FEE_RELEASE, &fee_pol(want, Some(FEE_MEMO)).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "pays 125000 zat to the marketplace fee address, expected exactly {want}"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fee_output_to_an_address_the_terms_do_not_name_is_refused() {
+        // Policy naming the buyer as the fee address: the real fee output goes elsewhere.
+        let p = policy_with(
+            TESTNET_SELLER,
+            4_855_000,
+            Some(4_875_000),
+            None,
+            &[format!("{TESTNET_BUYER}:125000")],
+        )
+        .unwrap();
+        let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
+        assert!(err.contains("pays 0 zat to the marketplace fee address"), "{err}");
+        // Without any fee in the policy, the fee output is an output to another address.
+        let p = policy_with(TESTNET_SELLER, 4_855_000, None, None, &[]).unwrap();
+        let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
+        assert!(err.contains("outputs to other addresses"), "{err}");
+    }
+
+    #[test]
+    fn seller_output_above_its_maximum_is_refused() {
+        let p = policy_with(
+            TESTNET_SELLER,
+            4_800_000,
+            Some(4_859_999),
+            None,
+            &[format!("{MARKETPLACE}:125000")],
+        )
+        .unwrap();
+        let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
+        assert!(err.contains("expected <= 4859999"), "{err}");
+    }
+
+    #[test]
+    fn fee_policy_rejects_duplicate_or_malformed_payments() {
+        assert!(
+            policy_with(TESTNET_SELLER, 0, None, None, &[format!("{TESTNET_SELLER}:1")]).is_err()
+        );
+        assert!(policy_with(
+            TESTNET_SELLER,
+            0,
+            None,
+            None,
+            &[format!("{MARKETPLACE}:1"), format!("{MARKETPLACE}:2")]
+        )
+        .is_err());
+        assert!(policy_with(TESTNET_SELLER, 0, None, None, &[MARKETPLACE.to_string()]).is_err());
+        assert!(policy_with(TESTNET_SELLER, 0, None, None, &[format!("{MARKETPLACE}:0")]).is_err());
+        assert!(policy_with(TESTNET_SELLER, 10, Some(9), None, &[]).is_err());
+    }
+
+    #[test]
+    fn sign_pczt_signs_the_fee_payout_and_refuses_without_the_fee() {
+        let r = round(&hex::decode(FEE_SIGHASH).unwrap());
+        let (id, kp) = r.keys.iter().next().unwrap();
+        let pol = fee_pol(125_000, Some(FEE_MEMO)).unwrap();
+        let (c, _) = sign_pczt(FEE_RELEASE, &pol, &r.pkg, &r.nonces[id], kp, FEE_ALPHA).unwrap();
+        assert_eq!(c.sighash, FEE_SIGHASH);
+        let err = sign_pczt(
+            FEE_MISSING,
+            &fee_pol(125_000, None).unwrap(),
+            &r.pkg,
+            &r.nonces[id],
+            kp,
+            FEE_ALPHA,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("marketplace fee address"), "{err}");
     }
 }
