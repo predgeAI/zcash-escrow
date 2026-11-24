@@ -23,6 +23,8 @@ export interface VerifiedOutput {
   to_expected: boolean;
   /** Index of the exact payment (e.g. marketplace fee) this output pays, if any. */
   exact_payment: number | null;
+  /** Change back to the escrow group's own internal address (staged payouts). */
+  to_group: boolean;
   /** The decrypted memo of an output that carries value (text, "" if empty, null if not text). */
   memo: string | null;
 }
@@ -50,6 +52,12 @@ export interface Expect {
   memo?: string;
   /** Further payments that must be made exactly (a marketplace fee): address and zat. */
   exact?: { to: string; zat: number }[];
+  /**
+   * Staged payout: change back to the escrow group, only to the internal scope of `ufvk` (the
+   * escrow's own UFVK, whose `ak` the signer checks against its FROST group key), exactly or at
+   * least this much. Without it, any output back to the escrow is refused.
+   */
+  change?: { ufvk: string; exact?: number; min?: number };
 }
 
 const policyArgs = (e: Expect) => [
@@ -57,6 +65,8 @@ const policyArgs = (e: Expect) => [
   ...(e.max !== undefined ? ["--max", String(e.max)] : []),
   ...(e.memo !== undefined ? ["--memo", e.memo] : []),
   ...(e.exact ?? []).flatMap((x) => ["--exact", `${x.to}:${x.zat}`]),
+  ...(e.change ? ["--change-to-group", e.change.ufvk,
+    ...(e.change.exact !== undefined ? ["--change-exact", String(e.change.exact)] : ["--change-min", String(e.change.min ?? 0)])] : []),
 ];
 
 /**
@@ -77,8 +87,9 @@ export function expectFromPayments(payments: Payment[], memo?: string): Expect {
 }
 
 /** Check `pczt` against `expect` without signing. Throws with the reason if any check fails. */
-export function checkPayout(pczt: string, expect: Expect): PayoutCheck {
-  return JSON.parse(frost(["outputs", "--pczt", pczt, ...policyArgs(expect)])) as PayoutCheck;
+export function checkPayout(pczt: string, expect: Expect, groupAk?: string): PayoutCheck {
+  return JSON.parse(frost(["outputs", "--pczt", pczt, ...policyArgs(expect),
+    ...(groupAk && expect.change ? ["--group-ak", groupAk] : [])])) as PayoutCheck;
 }
 
 /** Check `pczt` and produce this party's signature share over its sighash, from one read of the file. */

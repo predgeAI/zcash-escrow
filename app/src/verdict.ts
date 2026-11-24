@@ -184,7 +184,7 @@ function rawPub(pub: KeyObject): string {
   return (pub.export({ type: "spki", format: "der" }) as Buffer).subarray(12).toString("hex");
 }
 
-function pubFromRaw(hex: string): KeyObject {
+export function pubFromRaw(hex: string): KeyObject {
   const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(hex, "hex")]);
   return createPublicKey({ key: der, format: "der", type: "spki" });
 }
@@ -192,6 +192,21 @@ function pubFromRaw(hex: string): KeyObject {
 export function signVerdict(v: Verdict, key: ArbiterKey): SignedVerdict {
   if (v.arbiter_pubkey !== key.pubHex) throw new Error("verdict names a different arbiter key");
   return { verdict: v, signature: sign(null, Buffer.from(canonical(v)), key.priv).toString("hex") };
+}
+
+/** Ed25519 over canonical(body), hex. Used by verdicts, deal events, stage instructions and price quotes. */
+export function signCanonical(body: unknown, key: ArbiterKey): string {
+  return sign(null, Buffer.from(canonical(body)), key.priv).toString("hex");
+}
+
+/** Check an Ed25519 signature over canonical(body) against a raw public key (hex). Never throws. */
+export function verifyCanonical(body: unknown, signatureHex: string, pubHex: string): boolean {
+  try {
+    if (!/^[0-9a-f]{64}$/.test(pubHex) || !/^[0-9a-f]{128}$/.test(signatureHex)) return false;
+    return verify(null, Buffer.from(canonical(body)), pubFromRaw(pubHex), Buffer.from(signatureHex, "hex"));
+  } catch {
+    return false;
+  }
 }
 
 /** Anyone can check a verdict with only the JSON: no Zcash key, no network. */

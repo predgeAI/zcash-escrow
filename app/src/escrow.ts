@@ -28,14 +28,17 @@ const COMPOSE = join(ROOT, "chain/compose.yaml");
 // itself is not taken on trust: every signer requires it to be exactly the ZIP 317 conventional
 // fee (5,000 zat x max(2, actions)).
 
-type Party = "buyer" | "seller" | "arbiter";
-// "marketplace" only holds a wallet to receive fees (demo/testnet); it never holds a FROST share.
-type WalletParty = "buyer" | "seller" | "marketplace";
-const partyDir = (p: Party | "marketplace") => join(STATE, "parties", p);
+// Share holders. P2P escrows: buyer, seller, arbiter. Marketplace mode (marketplace.ts): the
+// marketplace operator, the policy co-signer and the arbiter.
+export type Party = "buyer" | "seller" | "arbiter" | "operator" | "policy";
+// "marketplace" (fee address) and "reserve" (PriceLock reserve) only hold wallets to receive
+// (and, for the reserve, to pay top-ups) in demo/testnet runs; they never hold a FROST share.
+export type WalletParty = "buyer" | "seller" | "marketplace" | "reserve";
+export const partyDir = (p: Party | WalletParty) => join(STATE, "parties", p);
 export const walletDir = (p: WalletParty) => (TESTNET && p === "buyer" ? TESTNET_BUYER : join(partyDir(p), "wallet"));
-const ageFile = (p: WalletParty) => (TESTNET && p === "buyer" ? join(TESTNET_BUYER, "identity.age") : join(partyDir(p), "wallet.age"));
-const jobDir = (job: string) => join(STATE, "jobs", job);
-const shareFile = (p: Party, job: string) => join(partyDir(p), "shares", `${job}.key.json`);
+export const ageFile = (p: WalletParty) => (TESTNET && p === "buyer" ? join(TESTNET_BUYER, "identity.age") : join(partyDir(p), "wallet.age"));
+export const jobDir = (job: string) => join(STATE, "jobs", job);
+export const shareFile = (p: Party, job: string) => join(partyDir(p), "shares", `${job}.key.json`);
 const readJson = <T>(p: string): T => JSON.parse(readFileSync(p, "utf8")) as T;
 const writeJson = (p: string, v: unknown) => {
   mkdirSync(join(p, ".."), { recursive: true });
@@ -74,16 +77,16 @@ export function balance(dir: string): { ironwood: number; total: number; tip: nu
 }
 
 /** Height at which `txid` was mined, as seen by the wallet in `dir` (sync it first). */
-function minedHeight(dir: string, txid: string): number | undefined {
+export function minedHeight(dir: string, txid: string): number | undefined {
   const txs = JSON.parse(devtool(["wallet", "-w", dir, "list-tx", "--json"], { quiet: true }).trim().split("\n").pop()!) as
     { txid: string; mined_height: number | null }[];
   return txs.find((t) => t.txid === txid)?.mined_height ?? undefined;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Testnet: no mining, so poll the light wallet until `done` holds (blocks are ~75 s apart). */
-async function waitChain(what: string, done: () => { ok: boolean; tip: number }, minutes = 90) {
+export async function waitChain(what: string, done: () => { ok: boolean; tip: number }, minutes = 90) {
   const until = Date.now() + minutes * 60_000;
   let shown = 0;
   for (;;) {
@@ -108,17 +111,20 @@ export function partyAddress(p: WalletParty): string {
   return orchardAddress(walletDir(p));
 }
 
-/** A receive-only wallet for the marketplace's fee address (demo and testnet runs). */
-export function ensureMarketplaceWallet(): string {
-  const w = walletDir("marketplace");
+/** A wallet for a party that only receives here (marketplace fee, reserve), in demo and testnet runs. */
+export function ensureWallet(p: "marketplace" | "reserve"): string {
+  const w = walletDir(p);
   if (!existsSync(join(w, "keys.toml"))) {
-    mkdirSync(partyDir("marketplace"), { recursive: true });
-    if (TESTNET) devtool(["wallet", "-w", w, "init", "--name", "marketplace", "-i", ageFile("marketplace"), "-n", NET, "-s", LIGHTWALLETD]);
-    else devtool(["wallet", "-w", w, "init", "--name", "marketplace", "-i", ageFile("marketplace"), "-n", "regtest",
+    mkdirSync(partyDir(p), { recursive: true });
+    if (TESTNET) devtool(["wallet", "-w", w, "init", "--name", p, "-i", ageFile(p), "-n", NET, "-s", LIGHTWALLETD]);
+    else devtool(["wallet", "-w", w, "init", "--name", p, "-i", ageFile(p), "-n", "regtest",
       "--activation-heights", HEIGHTS, "-s", LIGHTWALLETD]);
   }
-  return partyAddress("marketplace");
+  return partyAddress(p);
 }
+
+/** A receive-only wallet for the marketplace's fee address (demo and testnet runs). */
+export const ensureMarketplaceWallet = () => ensureWallet("marketplace");
 
 /** One-time: party wallets, arbiter verdict key, and point Zebra's coinbase at the buyer. */
 export async function setup(): Promise<void> {
@@ -176,7 +182,7 @@ export async function ensureBuyerFunds(need: number) {
   if (b.ironwood < need) throw new Error("buyer still underfunded after mining");
 }
 
-async function waitIndexer() {
+export async function waitIndexer() {
   // Zaino follows Zebra with a short delay; wait until the light wallet sees Zebra's tip.
   const tip = await rpc<number>("getblockcount");
   for (let i = 0; i < 60; i++) {
@@ -213,11 +219,28 @@ export function createJob(id: string, item: { name: string; bytes: Buffer; price
     const f = item.marketplace_fee;
     say(`  marketplace fee ${f.bps !== undefined ? `${f.bps} bps` : "fixed"} = ${fmt(marketplaceFeeZat(terms))} to ${f.address.slice(0, 20)}…, on refund: ${f.on_refund}`);
   }
-  // Trusted-dealer keygen (MVP). Each share is written to its party's own directory; the
-  // dealer copy is deleted. Milestone 2 replaces this with ZF frost DKG over frostd.
+  const g = makeEscrowGroup(id, ["buyer", "seller", "arbiter"]);
+  const job: Job = {
+    id, terms, terms_sha256: sha256(canonical(terms)), group_ak: g.ak, state: "created",
+    escrow_address: g.address,
+    escrow_ufvk: g.ufvk,
+  };
+  const ak = g.ak;
+  writeJson(join(jobDir(id), "terms.json"), terms);
+  saveJob(job);
+  say(`  escrow address ${job.escrow_address.slice(0, 32)}…  (FROST group key ${ak.slice(0, 16)}…)`);
+  return job;
+}
+
+/**
+ * A fresh 2-of-3 FROST group for one escrow, its address and UFVK, and a view-only wallet for it
+ * in the job directory. Trusted-dealer keygen (MVP): each share is written to its party's own
+ * directory and the dealer copy is deleted. Milestone 1 replaces this with ZF frost DKG over frostd.
+ */
+export function makeEscrowGroup(id: string, parties: [Party, Party, Party]): { ak: string; address: string; ufvk: string } {
   const tmp = join(jobDir(id), "dealer");
-  frost(["keygen", "--out", tmp]);
-  for (const p of ["buyer", "seller", "arbiter"] as const) {
+  frost(["keygen", "--out", tmp, "--parties", parties.join(",")]);
+  for (const p of parties) {
     mkdirSync(join(partyDir(p), "shares"), { recursive: true });
     writeFileSync(shareFile(p, id), readFileSync(join(tmp, `${p}.key.json`)), { mode: 0o600 });
   }
@@ -231,19 +254,12 @@ export function createJob(id: string, item: { name: string; bytes: Buffer; price
   const ua = /address: "(\S+)"/.exec(gen.stdout)![1];
   const ufvk = /Viewing Key: "(\S+)"/.exec(gen.stdout)![1];
   const enc = (v: string) => (TESTNET ? v : frost(["reencode", "--value", v, "--network", "regtest"]).trim());
-  const job: Job = {
-    id, terms, terms_sha256: sha256(canonical(terms)), group_ak: ak, state: "created",
-    escrow_address: enc(ua),
-    escrow_ufvk: enc(ufvk),
-  };
+  const g = { ak, address: enc(ua), ufvk: enc(ufvk) };
   const w = join(jobDir(id), "wallet");
   // Birthday defaults to the current tip, so the view-only wallet never scans old blocks.
-  devtool(["wallet", "-w", w, "init-fvk", "--name", `escrow-${id}`, "--fvk", job.escrow_ufvk, "-s", LIGHTWALLETD], { quiet: true });
+  devtool(["wallet", "-w", w, "init-fvk", "--name", `escrow-${id}`, "--fvk", g.ufvk, "-s", LIGHTWALLETD], { quiet: true });
   if (!TESTNET) pinHeights(w);
-  writeJson(join(jobDir(id), "terms.json"), terms);
-  saveJob(job);
-  say(`  escrow address ${job.escrow_address.slice(0, 32)}…  (FROST group key ${ak.slice(0, 16)}…)`);
-  return job;
+  return g;
 }
 
 export const loadJob = (id: string) => readJson<Job>(join(jobDir(id), "job.json"));
@@ -281,8 +297,13 @@ export async function fund(id: string): Promise<Job> {
 
 // ---------- payout: PCZT + 2-of-3 FROST ----------
 
-async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect: Expect,
-  arbiterGate?: (sighash: string) => void): Promise<string> {
+/**
+ * Two signers authorize every spend of `pczt` with 2-of-3 FROST. Each signer releases its share
+ * only through `zescrow-frost sign-pczt` with its own expectation (`expect`, or `expect(party)`);
+ * `gate(party, sighash)` runs after a signer's share is produced (arbiter records, stage ledgers).
+ */
+export async function frostSign(job: { id: string }, signers: [Party, Party], pczt: string, expect: Expect | ((p: Party) => Expect),
+  gate?: (party: Party, sighash: string) => void): Promise<string> {
   const dir = join(jobDir(job.id), "rounds");
   mkdirSync(dir, { recursive: true });
   const group = join(jobDir(job.id), "group.json");
@@ -304,15 +325,16 @@ async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect
       for (const p of signers) {
         let own;
         try {
-          own = signPayout(pczt, expect, {
+          own = signPayout(pczt, typeof expect === "function" ? expect(p) : expect, {
             key: shareFile(p, job.id), nonces: join(partyDir(p), "nonces", `${job.id}-${r.index}.json`),
             package: pkg, randomizer: r.alpha, out: join(dir, `${p}-${r.index}.share.json`),
           });
         } catch (e) {
           throw new Error(`${p} refuses: ${(e as Error).message}`);
         }
-        if (p === "arbiter") arbiterGate?.(own.sighash);
-        say(`  ${p} checked the PCZT (fee ${own.fee} zat, memo verified) and produced a signature share`);
+        gate?.(p, own.sighash);
+        const change = own.outputs.filter((o) => o.to_group).reduce((a, o) => a + o.value, 0);
+        say(`  ${p} checked the PCZT (fee ${own.fee} zat, memo verified${change ? `, change ${change} zat to the escrow's internal address` : ""}) and produced a signature share`);
       }
       sigs.push(frost(["aggregate", "--group", group, "--package", pkg, "--randomizer", r.alpha,
         "--shares", ...signers.map((p) => join(dir, `${p}-${r.index}.share.json`))]).trim());
@@ -378,7 +400,8 @@ async function payout(job: Job, payments: Payment[], memo: string, signers: [Par
   const t0 = Date.now();
   devtool(["pczt", "-w", w, "prove", pczt, "--output", proven]);
   say(`  Halo 2 proof built in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-  const signed = await frostSign(job, signers, proven, expectFromPayments(payments, memo), arbiterGate);
+  const signed = await frostSign(job, signers, proven, expectFromPayments(payments, memo),
+    arbiterGate && ((p, sighash) => { if (p === "arbiter") arbiterGate(sighash); }));
   const out = devtool(["pczt", "-w", w, "send", "-s", LIGHTWALLETD, signed]);
   const txid = out.trim().split("\n").pop()!;
   let height: number | undefined;
