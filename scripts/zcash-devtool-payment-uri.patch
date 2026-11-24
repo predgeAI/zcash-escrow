@@ -1,0 +1,64 @@
+diff --git a/src/commands/pczt/create.rs b/src/commands/pczt/create.rs
+index 2679a32..f89b645 100644
+--- a/src/commands/pczt/create.rs
++++ b/src/commands/pczt/create.rs
+@@ -40,17 +40,24 @@ pub(crate) struct Command {
+     account_id: Option<Uuid>,
+ 
+     /// The recipient's Unified, Sapling or transparent address
+-    #[arg(long)]
+-    address: String,
++    #[arg(long, required_unless_present = "payment_uri", conflicts_with = "payment_uri")]
++    address: Option<String>,
+ 
+     /// The amount in zatoshis
+-    #[arg(long)]
+-    value: u64,
++    #[arg(long, required_unless_present = "payment_uri", conflicts_with = "payment_uri")]
++    value: Option<u64>,
+ 
+     /// A memo to send to the recipient
+-    #[arg(long)]
++    #[arg(long, conflicts_with = "payment_uri")]
+     memo: Option<String>,
+ 
++    /// A [`ZIP 321`] payment request with one or more payments, used instead of
++    /// `--address`/`--value`/`--memo` to pay several recipients in one transaction.
++    ///
++    /// [`ZIP 321`]: https://zips.z.cash/zip-0321
++    #[arg(long)]
++    payment_uri: Option<String>,
++
+     /// Note management: the number of notes to maintain in the wallet
+     #[arg(long)]
+     #[arg(default_value_t = 4)]
+@@ -89,11 +96,14 @@ impl Command {
+         );
+         let input_selector = GreedyInputSelector::new();
+ 
+-        let request = TransactionRequest::new(vec![
++        let request = if let Some(uri) = &self.payment_uri {
++            TransactionRequest::from_uri(uri)?
++        } else {
++            TransactionRequest::new(vec![
+             Payment::new(
+-                ZcashAddress::from_str(&self.address)
++                ZcashAddress::from_str(self.address.as_deref().unwrap_or_default())
+                     .map_err(|_| error::Error::InvalidRecipient)?,
+-                Some(Zatoshis::from_u64(self.value).map_err(|_| error::Error::InvalidAmount)?),
++                Some(Zatoshis::from_u64(self.value.unwrap_or_default()).map_err(|_| error::Error::InvalidAmount)?),
+                 self.memo
+                     .map(|memo| Memo::from_str(&memo))
+                     .transpose()?
+@@ -103,8 +113,9 @@ impl Command {
+                 vec![],
+             )
+             .map_err(|e| e.with_index(0))?,
+-        ])
+-        .map_err(error::Error::from)?;
++            ])
++            .map_err(error::Error::from)?
++        };
+ 
+         let proposal = propose_transfer(
+             &mut db_data,

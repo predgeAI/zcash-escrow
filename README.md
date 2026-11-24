@@ -57,7 +57,7 @@ view-only escrow wallet will spend it, and payments waited from 1 to about 35 bl
 | 2-of-3 key generation | **trusted dealer** (ZF `reddsa` `generate_with_dealer`). Each share is written to its party's directory and the dealer copy is deleted. DKG is milestone 1. |
 | Escrow address and viewing key | ZF `zcash-sign generate` from the FROST group key. Funds land in **Ironwood**. |
 | Funding | buyer's own `zcash-devtool` wallet, ordinary shielded send. |
-| Payment | `zcash-devtool pczt create-max` → `pczt prove` → ZF `zcash-sign` (sighash + randomizer) → FROST rounds → `zcash-sign` applies the signature → `pczt send`. |
+| Payment | `zcash-devtool pczt create-max` (or `pczt create --payment-uri` with a marketplace fee) → `pczt prove` → ZF `zcash-sign` (sighash + randomizer) → FROST rounds → `zcash-sign` applies the signature → `pczt send`. |
 | Signer policy | **every** signer releases its share through one `zescrow-frost sign-pczt` call, which reads the PCZT once and, from those bytes (over the `pczt`/`orchard`/`zcash_note_encryption` crates): opens each output against its note commitment; opens the note ciphertext of each output that carries value, so the payee's wallet will see it, and checks that the payee's memo is the expected one (the verdict hash on the arbiter path); requires the fee to be exactly the ZIP 317 conventional fee; checks that the outputs pay the agreed address at least the agreed amount and nothing else; derives the sighash and refuses a signing package whose message is anything else. `zescrow-frost outputs` runs the same checks without signing. |
 | Verdicts | Ed25519-signed canonical JSON: job id, decision, reasons, evidence hashes, exact payment. Anyone can check it offline (`zescrow verify`). The payment memo carries the verdict hash. |
 | Adjudication | **stub rule** for sealed-listing digital goods (below). Real evidence review plugs in at `adjudicate()`. |
@@ -137,6 +137,64 @@ buyer wallet ──(shielded send)──▶ escrow address  (FROST group key; 2-
   "signature": "Ed25519 over the canonical JSON (sorted keys, no whitespace)"
 }
 ```
+
+A verdict for a deal with a marketplace fee uses `predge.zescrow.verdict/2`: `payout` is replaced
+by `payments`, a list of `{to, party, min_amount_zat, max_amount_zat}` (see "Marketplace fee").
+Deals without a fee keep getting `/1` verdicts, and `zescrow verify` reads both.
+
+## Marketplace fee
+
+A marketplace that lists the deal (for example a P2P store) can take its fee through the
+escrow. The fee is part of the deal terms, so it is fixed before the buyer funds the escrow
+(the funding memo carries the terms hash):
+
+```json
+"marketplace_fee": { "address": "u…", "bps": 250, "on_refund": "keep" }
+```
+
+- `bps` (basis points of `price_zat`, rounded down) or `fixed_zat`: exactly one of the two.
+- `on_refund`: `"keep"` = when the buyer is refunded, the marketplace still keeps its fee;
+  `"return"` = the buyer gets the whole escrow back.
+- No `marketplace_fee` in the terms = the behaviour above, unchanged.
+
+**Payout.** The payout transaction has two outputs: the winner (seller, or the buyer on a
+refund) and the marketplace's fee address. The fee output gets exactly the fee; the winner gets
+the rest minus the ZIP 317 network fee. Nothing goes back to the escrow address: the escrow note
+is emptied and there is no change output. A refund with `"return"` is a single output, as before.
+
+**Signer check.** The fee output goes through the same `zescrow-frost sign-pczt` check as the
+winner's output, from the same single read of the PCZT. The output is opened against its note
+commitment, and its note ciphertext must open, so the marketplace's wallet sees the note. The
+ZIP 317 fee is counted over all the transaction's actions (3 for one spend and two paying
+outputs). On top of that, the policy gets the fee as an exact payment (`--exact <address>:<zat>`)
+and an upper bound for the winner (`--max`). The marketplace output must be exactly the fee, and
+the winner's output must be within `FEE_ALLOWANCE_ZAT` (20,000 zat) of the rest. Any other
+output is refused. A PCZT that drops, lowers, raises or redirects the fee output is refused, so
+nobody can change the fee after funding. In a dispute the arbiter's verdict (`/2`) lists both
+outputs, and the arbiter signs only that transaction. The verdict-hash memo is required on the
+winner's output.
+
+**Building the transaction.** `zcash-devtool pczt create-max` pays one address, and
+`pczt create` pays one address and sends change back to the wallet. `scripts/zcash-devtool-payment-uri.patch`
+(applied by `build-deps.sh`, about 20 lines) lets `pczt create` take a ZIP 321 payment request
+with several payments instead (`--payment-uri`). The app sets the fee output exactly and the
+winner's output to the rest minus the network fee. It tries fees from 10,000 zat upward until
+the wallet accepts one, which is the ZIP 317 conventional fee, so change is zero.
+
+Testnet path `AF` (`npm run testnet -- AF`) runs a release with a 2.5% fee. It also shows the
+signers refusing a release that skips the fee output.
+
+**Public testnet, 24.11.2026 (path AF):** escrow of 0.05 TAZ with a 250 bps fee, funded in tx
+`19872d6864259b47159438b225d13310e4c64c7db2bc2f0ae1662aea5aeea93e` (height 4660752). A release
+paying everything to the seller was refused: "buyer refuses: PCZT pays 0 zat to the marketplace
+fee address, expected exactly 125000". Buyer + seller then co-signed the two-output payout,
+tx `939b8ec13802a8571f96b0237898022c7554e0428d9b91217180327942ea8564` (height 4660764): seller
+0.0486 TAZ, marketplace 0.00125 TAZ, ZIP 317 fee 0.00015 TAZ (3 actions), escrow empty. Both
+PCZTs (wallet metadata redacted) are test fixtures for the Rust and npm tests. Re-run the same
+day with every signer going through `zescrow-frost sign-pczt --exact`: funded in
+`feb536db478e517d696ece29d54f4294ad254f40952b7e00fd3f958f586a642e` (height 4660787), no-fee
+release refused by the same check, payout `e8150d4fea3764cbaf52bae624db0b937fefda36e11c2f54a728e081db041233`
+(height 4660798), with the same split.
 
 ### The demo's adjudication rule (stub)
 
@@ -258,7 +316,9 @@ key generation is still a trusted dealer and the signer transport is still a loc
   NU7 height, so transactions built with it get the wrong consensus branch id and are rejected. Build `zcash-devtool`
   and `zcash-sign` against a librustzcash checkout with `MainNetwork` NU7 set to `BlockHeight(3_543_405)` (upstream
   `f53a9b46`) and point the app at them with `ZCASH_DEVTOOL=...` and `ZCASH_SIGN_PCZT=...`;
-- the run refuses to start without `CONFIRM_MAINNET=zcash`.
+- the run refuses to start without `CONFIRM_MAINNET=zcash`;
+- the marketplace-fee path needs `scripts/zcash-devtool-payment-uri.patch` applied to that `zcash-devtool` build too
+  (it has not been run on mainnet).
 
 ```bash
 cd app && CONFIRM_MAINNET=zcash npm run mainnet      # or: npm run mainnet -- B
@@ -294,9 +354,10 @@ chain/            regtest compose file (Zebra 7.0.0 + Zaino 0.10.2), configs, ac
 crates/zescrow-frost/  per-party FROST CLI over ZF reddsa / frost-rerandomized, PCZT checks over pczt / orchard (no crypto of its own)
 app/src/escrow.ts      protocol: jobs, funding, PCZT spend, signer checks, verdict enforcement
 app/src/payout-check.ts  wrappers for the signer's PCZT check and check-and-sign
-app/src/verdict.ts     verdict schema, Ed25519 signing, adjudication rule
+app/src/verdict.ts     verdict schema (/1, /2), Ed25519 signing, adjudication rule, marketplace fee split
 app/src/cli.ts         demo + verify; app/src/server.ts + app/ui: demo UI
-scripts/          build-deps.sh (pinned upstream tools), chain-up.sh, zcash-sign-nu7.patch (testnet signing)
+scripts/          build-deps.sh (pinned upstream tools), chain-up.sh, zcash-sign-nu7.patch (testnet signing),
+                  zcash-devtool-payment-uri.patch (multi-output PCZTs for the marketplace fee)
 ```
 
 License: MIT.

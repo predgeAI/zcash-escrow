@@ -59,3 +59,22 @@ test("a fee above the ZIP 317 conventional fee is refused", { skip }, () => {
 test("underpayment is refused", { skip }, () => {
   assert.throws(() => checkPayout(FIXTURE, { to: PAYEE, min: PAID + 1 }), /pays 99990000 zat/);
 });
+
+// Marketplace fee: the two-output release from testnet run AF and the no-fee release refused there.
+const FEE_RELEASE = join(FIXTURES, "testnet-fee-release.proven.pczt");
+const FEE_MISSING = join(FIXTURES, "testnet-fee-missing.proven.pczt");
+const SELLER = "utest197jhccyr9h55qx8603krk2ju9zvgnjstuj2uy0x9fsrm9jntdmxrdccl9syffa93d9csf7wew6czml70mryudvetjttza7vuusqckzuz";
+const MARKETPLACE = "utest1dpdrfv009asg0yh0vjmw7wptx0lx8dz4zzhj5yn6z5kzw08yge6922npfswvm06gzl2t4fzds00dzj5pcexeunqdnadpfq5cz56ykxct";
+const feeExpect = (zat: number, memo?: string) => ({ to: SELLER, min: 4_855_000, max: 4_875_000, memo, exact: [{ to: MARKETPLACE, zat }] });
+
+test("a two-output fee payout passes: seller in bounds, fee exact, ZIP 317 fee for 3 actions", { skip }, () => {
+  const c = checkPayout(FEE_RELEASE, feeExpect(125_000, "zescrow release AF-mwurzoyy"));
+  assert.equal(c.fee, 15_000);
+  assert.deepEqual(c.outputs.filter((o) => o.value > 0).map((o) => [o.value, o.to_expected, o.exact_payment]), [[4_860_000, true, null], [125_000, false, 0]]);
+});
+test("a payout without the fee output is refused", { skip }, () => {
+  assert.throws(() => checkPayout(FEE_MISSING, feeExpect(125_000)), /pays 0 zat to the marketplace fee address, expected exactly 125000/);
+});
+test("a fee output with another amount is refused", { skip }, () => {
+  assert.throws(() => checkPayout(FEE_RELEASE, feeExpect(124_999)), /pays 125000 zat to the marketplace fee address, expected exactly 124999/);
+});

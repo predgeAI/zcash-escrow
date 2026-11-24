@@ -11,11 +11,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { checkPayout, signPayout, type Expect } from "./payout-check.ts";
+import { checkPayout, expectFromPayments, signPayout, type Expect } from "./payout-check.ts";
 import { BIN, LIGHTWALLETD, MAINNET, NET, NETWORK, ROOT, TESTNET, devtool, frost, mine, rpc, say, zcashSign } from "./tools.ts";
 import {
-  adjudicate, canonical, loadArbiterKey, sha256, signVerdict, verifyVerdict,
-  type Decision, type EvidenceItem, type SignedVerdict, type Terms, type Verdict,
+  FEE_ALLOWANCE_ZAT, adjudicate, canonical, loadArbiterKey, marketplaceFeeZat, sha256, signVerdict, splitPayout,
+  validateMarketplaceFee, verdictPayments, verifyVerdict,
+  type Decision, type EvidenceItem, type MarketplaceFee, type Payment, type SignedVerdict, type Terms, type Verdict,
 } from "./verdict.ts";
 
 export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, MAINNET ? ".state-mainnet" : TESTNET ? ".state-testnet" : ".state");
@@ -23,14 +24,16 @@ export const STATE = process.env.ZESCROW_STATE ?? join(ROOT, MAINNET ? ".state-m
 const TESTNET_BUYER = process.env.ZESCROW_BUYER_WALLET ?? join(ROOT, MAINNET ? ".mainnet-buyer" : ".testnet-buyer");
 const HEIGHTS = join(ROOT, "chain/activation-heights.toml");
 const COMPOSE = join(ROOT, "chain/compose.yaml");
-// Funding headroom and the verdict's minimum payout. The fee itself is not taken on trust: every
-// signer requires it to be exactly the ZIP 317 conventional fee (2 actions x 5,000 zat today).
-const FEE_ALLOWANCE_ZAT = 20_000;
+// FEE_ALLOWANCE_ZAT (verdict.ts) is funding headroom and the bound on the winner's payout. The fee
+// itself is not taken on trust: every signer requires it to be exactly the ZIP 317 conventional
+// fee (5,000 zat x max(2, actions)).
 
 type Party = "buyer" | "seller" | "arbiter";
-const partyDir = (p: Party) => join(STATE, "parties", p);
-export const walletDir = (p: "buyer" | "seller") => (TESTNET && p === "buyer" ? TESTNET_BUYER : join(partyDir(p), "wallet"));
-const ageFile = (p: "buyer" | "seller") => (TESTNET && p === "buyer" ? join(TESTNET_BUYER, "identity.age") : join(partyDir(p), "wallet.age"));
+// "marketplace" only holds a wallet to receive fees (demo/testnet); it never holds a FROST share.
+type WalletParty = "buyer" | "seller" | "marketplace";
+const partyDir = (p: Party | "marketplace") => join(STATE, "parties", p);
+export const walletDir = (p: WalletParty) => (TESTNET && p === "buyer" ? TESTNET_BUYER : join(partyDir(p), "wallet"));
+const ageFile = (p: WalletParty) => (TESTNET && p === "buyer" ? join(TESTNET_BUYER, "identity.age") : join(partyDir(p), "wallet.age"));
 const jobDir = (job: string) => join(STATE, "jobs", job);
 const shareFile = (p: Party, job: string) => join(partyDir(p), "shares", `${job}.key.json`);
 const readJson = <T>(p: string): T => JSON.parse(readFileSync(p, "utf8")) as T;
@@ -101,8 +104,20 @@ function pinHeights(dir: string) {
   writeFileSync(cfg, readFileSync(cfg, "utf8").replace(/^nu7 = .*$/m, `nu7 = ${nu7}`));
 }
 
-export function partyAddress(p: "buyer" | "seller"): string {
+export function partyAddress(p: WalletParty): string {
   return orchardAddress(walletDir(p));
+}
+
+/** A receive-only wallet for the marketplace's fee address (demo and testnet runs). */
+export function ensureMarketplaceWallet(): string {
+  const w = walletDir("marketplace");
+  if (!existsSync(join(w, "keys.toml"))) {
+    mkdirSync(partyDir("marketplace"), { recursive: true });
+    if (TESTNET) devtool(["wallet", "-w", w, "init", "--name", "marketplace", "-i", ageFile("marketplace"), "-n", NET, "-s", LIGHTWALLETD]);
+    else devtool(["wallet", "-w", w, "init", "--name", "marketplace", "-i", ageFile("marketplace"), "-n", "regtest",
+      "--activation-heights", HEIGHTS, "-s", LIGHTWALLETD]);
+  }
+  return partyAddress("marketplace");
 }
 
 /** One-time: party wallets, arbiter verdict key, and point Zebra's coinbase at the buyer. */
@@ -179,7 +194,7 @@ export const fmt = (zat: number) => `${(zat / 1e8).toFixed(8)} ${NETWORK === "te
 // ---------- job lifecycle ----------
 
 /** Seller lists an item (commits to its hash); a fresh 2-of-3 FROST escrow is created for the job. */
-export function createJob(id: string, item: { name: string; bytes: Buffer; price_zat: number; deliver_in_s?: number }): Job {
+export function createJob(id: string, item: { name: string; bytes: Buffer; price_zat: number; deliver_in_s?: number; marketplace_fee?: MarketplaceFee }): Job {
   say(`== job ${id}: create escrow for "${item.name}" at ${fmt(item.price_zat)}`);
   if (existsSync(jobDir(id))) rmSync(jobDir(id), { recursive: true });
   for (const p of ["buyer", "seller", "arbiter"] as const) rmSync(shareFile(p, id), { force: true });
@@ -191,6 +206,13 @@ export function createJob(id: string, item: { name: string; bytes: Buffer; price
     buyer_refund_address: partyAddress("buyer"),
     seller_payout_address: partyAddress("seller"),
   };
+  // Only set when present, so terms (and their hash) without a fee are byte-for-byte unchanged.
+  if (item.marketplace_fee) {
+    terms.marketplace_fee = item.marketplace_fee;
+    validateMarketplaceFee(terms);
+    const f = item.marketplace_fee;
+    say(`  marketplace fee ${f.bps !== undefined ? `${f.bps} bps` : "fixed"} = ${fmt(marketplaceFeeZat(terms))} to ${f.address.slice(0, 20)}…, on refund: ${f.on_refund}`);
+  }
   // Trusted-dealer keygen (MVP). Each share is written to its party's own directory; the
   // dealer copy is deleted. Milestone 2 replaces this with ZF frost DKG over frostd.
   const tmp = join(jobDir(id), "dealer");
@@ -301,17 +323,62 @@ async function frostSign(job: Job, signers: [Party, Party], pczt: string, expect
   return signed;
 }
 
-async function payout(job: Job, to: string, memo: string, signers: [Party, Party], arbiterGate?: (s: string) => void) {
+/** ZIP 321 payment request URI (amounts in ZEC, memos base64url without padding). */
+export function zip321Uri(payments: { to: string; amount_zat: number; memo?: string }[]): string {
+  const zec = (z: number) => {
+    const s = `${Math.floor(z / 1e8)}.${String(z % 1e8).padStart(8, "0")}`.replace(/0+$/, "");
+    return s.endsWith(".") ? s.slice(0, -1) : s;
+  };
+  const parts = payments.flatMap((p, i) => {
+    const k = (n: string) => (i === 0 ? n : `${n}.${i}`);
+    const q = [`${k("address")}=${p.to}`, `${k("amount")}=${zec(p.amount_zat)}`];
+    if (p.memo) q.push(`${k("memo")}=${Buffer.from(p.memo).toString("base64url")}`);
+    return q;
+  });
+  return `zcash:?${parts.join("&")}`;
+}
+
+/**
+ * Build a PCZT that pays every payment and leaves nothing in the escrow. The fixed payments
+ * (marketplace fee) get their exact amount; the first payment (the winner) gets the rest minus
+ * the network fee. `zcash-devtool pczt create` (patched to take a ZIP 321 request, see
+ * scripts/zcash-devtool-payment-uri.patch) adds a change output for any excess, so try network
+ * fees from the lowest upward: the first one the wallet accepts is the ZIP 317 conventional fee,
+ * and change is zero. The signers refuse change, and any fee that is not exactly ZIP 317's.
+ */
+function createSplitPczt(w: string, payments: Payment[], memo: string, out: string): number {
+  const total = balance(w).total;
+  const fixed = payments.slice(1).reduce((s, p) => s + p.min_amount_zat, 0);
+  let last: unknown;
+  for (let fee = 10_000; fee <= FEE_ALLOWANCE_ZAT; fee += 5_000) {
+    const uri = zip321Uri([
+      { to: payments[0].to, amount_zat: total - fixed - fee, memo },
+      ...payments.slice(1).map((p) => ({ to: p.to, amount_zat: p.min_amount_zat, memo: `${memo} ${p.party} fee` })),
+    ]);
+    try {
+      devtool(["pczt", "-w", w, "create", "--payment-uri", uri, "--output", out]);
+      say(`  PCZT pays ${payments.length} outputs, network fee ${fee} zat`);
+      return fee;
+    } catch (e) {
+      if (!/insufficient/i.test(String(e))) throw e;
+      last = e;
+    }
+  }
+  throw new Error(`no network fee up to ${FEE_ALLOWANCE_ZAT} zat fits: ${last}`);
+}
+
+async function payout(job: Job, payments: Payment[], memo: string, signers: [Party, Party], arbiterGate?: (s: string) => void) {
   const w = join(jobDir(job.id), "wallet");
   balance(w);
   const tag = signers.join("-");
   const pczt = join(jobDir(job.id), `payout-${tag}.pczt`);
   const proven = join(jobDir(job.id), `payout-${tag}.proven.pczt`);
-  devtool(["pczt", "-w", w, "create-max", "--address", to, "--memo", memo, "--output", pczt]);
+  if (payments.length === 1) devtool(["pczt", "-w", w, "create-max", "--address", payments[0].to, "--memo", memo, "--output", pczt]);
+  else createSplitPczt(w, payments, memo, pczt);
   const t0 = Date.now();
   devtool(["pczt", "-w", w, "prove", pczt, "--output", proven]);
   say(`  Halo 2 proof built in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-  const signed = await frostSign(job, signers, proven, { to, min: (job.funded_zat ?? job.terms.price_zat) - FEE_ALLOWANCE_ZAT, memo }, arbiterGate);
+  const signed = await frostSign(job, signers, proven, expectFromPayments(payments, memo), arbiterGate);
   const out = devtool(["pczt", "-w", w, "send", "-s", LIGHTWALLETD, signed]);
   const txid = out.trim().split("\n").pop()!;
   let height: number | undefined;
@@ -333,7 +400,9 @@ export async function release(id: string): Promise<Job> {
   const job = loadJob(id);
   if (job.state !== "funded") throw new Error(`job ${id} is ${job.state}`);
   say(`== job ${id}: release (buyer + seller co-sign, arbiter not involved)`);
-  ({ txid: job.payout_txid, height: job.payout_height } = await payout(job, job.terms.seller_payout_address, `zescrow release ${id}`, ["buyer", "seller"]));
+  // Buyer and seller each check the outputs against the terms they agreed (fee included).
+  const payments = splitPayout(job.terms, job.funded_zat ?? job.terms.price_zat, "seller");
+  ({ txid: job.payout_txid, height: job.payout_height } = await payout(job, payments, `zescrow release ${id}`, ["buyer", "seller"]));
   job.state = "released";
   saveJob(job);
   say(`  paid seller: tx ${job.payout_txid}`);
@@ -401,11 +470,11 @@ export async function enforceVerdict(id: string): Promise<Job> {
     writeJson(join(jobDir(id), "arbiter-cosign.json"), { verdict_sha256: vhash, sighash, at: new Date().toISOString() });
   };
   ({ txid: job.payout_txid, height: job.payout_height } =
-    await payout(job, sv.verdict.payout.to, `zescrow verdict ${vhash.slice(0, 32)}`, [sv.verdict.cosigner_with, "arbiter"], gate));
+    await payout(job, verdictPayments(sv.verdict), `zescrow verdict ${vhash.slice(0, 32)}`, [sv.verdict.cosigner_with, "arbiter"], gate));
   job.state = sv.verdict.decision === "release_to_seller" ? "released" : "refunded";
   job.verdict_sha256 = vhash;
   saveJob(job);
-  say(`  paid ${sv.verdict.payout.party}: tx ${job.payout_txid}`);
+  say(`  paid ${verdictPayments(sv.verdict).map((p) => p.party).join(" + ")}: tx ${job.payout_txid}`);
   return job;
 }
 
@@ -413,16 +482,35 @@ export function arbiterRefusesWrongPayout(id: string): Promise<string> {
   // Used by the demo to show the arbiter cannot be talked into a payout the verdict didn't name.
   const job = loadJob(id);
   const sv = readJson<SignedVerdict>(join(jobDir(id), "verdict.json"));
-  const wrong = sv.verdict.payout.party === "buyer" ? job.terms.seller_payout_address : job.terms.buyer_refund_address;
+  const wrong = verdictPayments(sv.verdict)[0].party === "buyer" ? job.terms.seller_payout_address : job.terms.buyer_refund_address;
   const w = join(jobDir(id), "wallet");
   const pczt = join(jobDir(id), "wrong.pczt");
   devtool(["pczt", "-w", w, "create-max", "--address", wrong, "--output", pczt], { quiet: true });
   devtool(["pczt", "-w", w, "prove", pczt, "--output", pczt + ".proven"], { quiet: true });
   const vhash = sha256(canonical(sv));
   return Promise.resolve()
-    .then(() => checkPayout(pczt + ".proven", { to: sv.verdict.payout.to, min: sv.verdict.payout.min_amount_zat, memo: `zescrow verdict ${vhash.slice(0, 32)}` }))
+    .then(() => checkPayout(pczt + ".proven", expectFromPayments(verdictPayments(sv.verdict), `zescrow verdict ${vhash.slice(0, 32)}`)))
     .then(() => "arbiter signed (unexpected)")
     .catch((e: Error) => `arbiter refuses: ${e.message}`);
+}
+
+/**
+ * Used by the fee demo: someone builds a release that pays the whole escrow to the seller and
+ * skips the marketplace fee output. The buyer's check (the same `zescrow-frost` check it signs
+ * through) refuses it, because it does not match the fee fixed in the terms.
+ */
+export function signersRefuseMissingFee(id: string): Promise<string> {
+  const job = loadJob(id);
+  const w = join(jobDir(id), "wallet");
+  const pczt = join(jobDir(id), "nofee.pczt");
+  const memo = `zescrow release ${id}`;
+  devtool(["pczt", "-w", w, "create-max", "--address", job.terms.seller_payout_address, "--memo", memo, "--output", pczt], { quiet: true });
+  devtool(["pczt", "-w", w, "prove", pczt, "--output", pczt + ".proven"], { quiet: true });
+  const expect = expectFromPayments(splitPayout(job.terms, job.funded_zat ?? job.terms.price_zat, "seller"), memo);
+  return Promise.resolve()
+    .then(() => checkPayout(pczt + ".proven", expect))
+    .then(() => "buyer signed (unexpected)")
+    .catch((e: Error) => `buyer refuses: ${e.message}`);
 }
 
 export type { Decision };

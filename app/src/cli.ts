@@ -3,10 +3,10 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  STATE, arbiterRefusesWrongPayout, balance, createJob, enforceVerdict, fmt, fund, issueVerdict,
-  listJobs, release, setup, submitEvidence, walletDir,
+  STATE, arbiterRefusesWrongPayout, balance, createJob, enforceVerdict, ensureMarketplaceWallet, fmt, fund, issueVerdict,
+  listJobs, release, setup, signersRefuseMissingFee, submitEvidence, walletDir,
 } from "./escrow.ts";
-import { verifyVerdict, type SignedVerdict } from "./verdict.ts";
+import { verdictPayments, verifyVerdict, type SignedVerdict } from "./verdict.ts";
 import { MAINNET, NETWORK, TESTNET, say } from "./tools.ts";
 
 const ZEC = 100_000_000;
@@ -89,6 +89,20 @@ export async function testnet(paths: string[]) {
       await fund(a.id);
       submitEvidence(a.id, "seller", "delivery", "sent logo-pack.zip", logo);
       await release(a.id);
+    } else if (path === "AF") {
+      // A with a marketplace fee: 2.5% of the price to the marketplace, fixed in the terms.
+      const logo = Buffer.from("logo-pack.zip bytes " + run);
+      const mkt = ensureMarketplaceWallet();
+      const a = createJob(`AF-${run}`, {
+        name: "Logo pack (digital goods)", bytes: logo, price_zat: Math.round(0.05 * k * ZEC),
+        marketplace_fee: { address: mkt, bps: 250, on_refund: "keep" },
+      });
+      ids.push(a.id);
+      await fund(a.id);
+      submitEvidence(a.id, "seller", "delivery", "sent logo-pack.zip", logo);
+      say("  try: ask the signers to release everything to the seller, skipping the marketplace fee");
+      say(`  -> ${await signersRefuseMissingFee(a.id)}`);
+      await release(a.id);
     } else if (path === "C") {
       const data = Buffer.from("weather-dataset.csv " + run);
       const c = createJob(`C-${run}`, { name: "Weather dataset", bytes: data, price_zat: Math.round(0.05 * k * ZEC) });
@@ -105,7 +119,8 @@ export async function testnet(paths: string[]) {
   for (const j of listJobs().filter((j) => ids.includes(j.id))) {
     say(`  ${j.id.padEnd(12)} ${j.state.padEnd(9)} ${fmt(j.funded_zat ?? 0)}  fund tx ${j.fund_txid} @${j.fund_height}  payout tx ${j.payout_txid} @${j.payout_height}`);
   }
-  say(`  buyer wallet now ${fmt(balance(walletDir("buyer")).total)}, seller ${fmt(balance(walletDir("seller")).total)}`);
+  say(`  buyer wallet now ${fmt(balance(walletDir("buyer")).total)}, seller ${fmt(balance(walletDir("seller")).total)}` +
+    (paths.includes("AF") ? `, marketplace ${fmt(balance(walletDir("marketplace")).total)}` : ""));
   say(`  done in ${((Date.now() - t0) / 1000).toFixed(0)} s`);
 }
 
@@ -126,14 +141,15 @@ async function main() {
     case "verify": {
       const sv = JSON.parse(readFileSync(args[0], "utf8")) as SignedVerdict;
       const ok = verifyVerdict(sv, args[1]);
-      console.log(ok ? `valid verdict: ${sv.verdict.decision} for ${sv.verdict.job_id}, pay ${sv.verdict.payout.party}` : "INVALID verdict");
+      const pays = ok ? verdictPayments(sv.verdict).map((p) => `${p.party} ${p.min_amount_zat}${p.max_amount_zat !== undefined && p.max_amount_zat !== p.min_amount_zat ? `..${p.max_amount_zat}` : ""} zat`).join(", ") : "";
+      console.log(ok ? `valid verdict (${sv.verdict.schema}): ${sv.verdict.decision} for ${sv.verdict.job_id}, pay ${pays}` : "INVALID verdict");
       process.exit(ok ? 0 : 1);
     }
     case "status":
       for (const j of listJobs()) console.log(`${j.id}\t${j.state}\t${j.escrow_address.slice(0, 24)}…\t${j.payout_txid ?? ""}`);
       return;
     default:
-      console.log("usage: zescrow demo | testnet [B A C] | release <job> | enforce <job> | setup | status | verify <verdict.json> [arbiter_pubkey_hex]");
+      console.log("usage: zescrow demo | testnet [B A C AF] | release <job> | enforce <job> | setup | status | verify <verdict.json> [arbiter_pubkey_hex]");
   }
 }
 

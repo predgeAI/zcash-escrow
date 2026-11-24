@@ -14,6 +14,10 @@ fetch() { # repo dir commit
 }
 fetch ZcashFoundation/frost-tools frost-tools 53df99c
 fetch zcash/zcash-devtool zcash-devtool 0b3436b
+# Marketplace-fee payouts need a PCZT with two payment outputs. `pczt create` takes one
+# --address/--value; this patch lets it take a ZIP 321 payment request (--payment-uri) instead.
+git -C "$DEPS/zcash-devtool" apply --check "$ROOT/scripts/zcash-devtool-payment-uri.patch" 2>/dev/null &&
+  git -C "$DEPS/zcash-devtool" apply "$ROOT/scripts/zcash-devtool-payment-uri.patch"
 (cd "$DEPS/frost-tools" && nice -n 15 cargo build --release -j 2 -p zcash-sign -p frost-client -p frostd)
 # Static liblzma avoids linking a Homebrew x86_64 dylib on Apple Silicon.
 (cd "$DEPS/zcash-devtool" && LZMA_API_STATIC=1 PKG_CONFIG=/usr/bin/false nice -n 15 cargo build --release -j 2 --features regtest_support)
