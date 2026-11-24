@@ -8,6 +8,7 @@ import {
 } from "./escrow.ts";
 import { verdictPayments, verifyCanonical, verifyVerdict, type SignedVerdict } from "./verdict.ts";
 import { marketplaceScenario } from "./marketplace.ts";
+import { orderPayScenario } from "./orderpay.ts";
 import type { SignedStage } from "./deal.ts";
 import { MAINNET, NETWORK, TESTNET, say } from "./tools.ts";
 
@@ -109,6 +110,16 @@ export async function testnet(paths: string[]) {
       // Marketplace mode: staged payouts with change back to the escrow, fiat terms, PriceLock.
       if (MAINNET) throw new Error("path M runs on testnet only");
       await marketplaceScenario({ fixtures: process.env.ZESCROW_FIXTURES, resume: process.env.ZESCROW_RESUME });
+    } else if (path === "OPA" || path === "OPB") {
+      // Milestone order (25% on preview, 75% on acceptance) paid to a seller address from the
+      // environment; A is the normal path, B a dispute refunded to the client. Testnet only.
+      if (MAINNET) throw new Error("path OP runs on testnet only");
+      const seller = process.env.ORDERPAY_SELLER;
+      if (!seller) throw new Error("set ORDERPAY_SELLER to the seller's testnet address");
+      await orderPayScenario(path === "OPA" ? "A" : "B", {
+        seller, priceMicros: Number(process.env.ORDERPAY_PRICE_MICROS ?? 4_000_000_000),
+        amountCents: Number(process.env.ORDERPAY_USD_CENTS ?? 20_000), resume: process.env.ZESCROW_RESUME,
+      });
     } else if (path === "C") {
       const data = Buffer.from("weather-dataset.csv " + run);
       const c = createJob(`C-${run}`, { name: "Weather dataset", bytes: data, price_zat: Math.round(0.05 * k * ZEC) });
@@ -165,7 +176,7 @@ async function main() {
       for (const j of listJobs()) console.log(`${j.id}\t${j.state}\t${j.escrow_address.slice(0, 24)}…\t${j.payout_txid ?? ""}`);
       return;
     default:
-      console.log("usage: zescrow demo | testnet [B A C AF M] | release <job> | enforce <job> | setup | status | verify <verdict.json> [arbiter_pubkey_hex]");
+      console.log("usage: zescrow demo | testnet [B A C AF M OPA OPB] | release <job> | enforce <job> | setup | status | verify <verdict.json> [arbiter_pubkey_hex]");
   }
 }
 
