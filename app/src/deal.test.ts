@@ -53,7 +53,8 @@ class Deal {
     return se;
   }
   fund(price = 40, zat?: number) {
-    return this.ev({ type: "funded", funded_zat: zat ?? 5_045_000, quote: quote(price, this.min + 1) });
+    const q = quote(price, this.min + 1);
+    return this.ev({ type: "funded", funded_zat: zat ?? 5_045_000, quote: q, paid_at: q.quote.issued_at });
   }
   plan(stage: StageKind, price: number, recipient?: RecipientBinding) {
     return planStage(this.s, { stage, quote: quote(price, this.min), recipient, at: at(this.min) });
@@ -89,8 +90,15 @@ test("fiat terms: 9500/400/100 bps of the fiat amount and of the ZEC principal a
 test("funding must be exactly principal + network fee budget, at a fresh quote from the terms' quote key", () => {
   throwsIllegal(() => new Deal().fund(40, 5_000_000), /expected 5045000/);
   const d = new Deal();
-  throwsIllegal(() => d.ev({ type: "funded", funded_zat: 5_045_000, quote: quote(40, 0, OTHER) }), /key the deal terms do not name/);
-  throwsIllegal(() => new Deal().ev({ type: "funded", funded_zat: 5_045_000, quote: quote(40, -60) }), /older than the 900 s/);
+  const fund = (q: ReturnType<typeof quote>, paidAt: Date) => ({ type: "funded" as const, funded_zat: 5_045_000, quote: q, paid_at: paidAt.toISOString() });
+  throwsIllegal(() => d.ev(fund(quote(40, 0, OTHER), at(0))), /key the deal terms do not name/);
+  throwsIllegal(() => new Deal().ev(fund(quote(40, -60), at(0))), /older than the 900 s/);
+  // Confirmations may take longer than a quote lives: freshness is judged when the buyer paid.
+  const slow = new Deal();
+  slow.min = 30;
+  slow.ev(fund(quote(40, 0), at(1)));
+  assert.equal(slow.s.status, "funded");
+  throwsIllegal(() => new Deal().ev(fund(quote(40, 0), at(10))), /paid_at is missing or after the event/);
   const f = new Deal();
   f.fund();
   throwsIllegal(() => f.fund(), /already funded/);
@@ -129,7 +137,8 @@ test("CrowdStore path: seller 95% (ZEC up), negative review after payout, reward
 
   // The fee empties the escrow: unused network fee budget goes to the reserve, no change.
   const s3 = d.stage("fee_payout", 40);
-  assert.deepEqual(pays(s3.ins), [["marketplace_fee", 50_000], ["reserve", 10_000]]);
+  assert.deepEqual(pays(s3.ins), [["marketplace_fee", 50_000], ["reserve", 5_000]]);
+  assert.equal(s3.ins.network_fee_zat, 15_000);
   assert.equal(s3.ins.change, null);
   assert.equal(s3.expect.change, undefined);
   assert.equal(d.s.escrow_zat, 0);
@@ -183,7 +192,7 @@ test("full refund: 100% of the fiat value at the refund quote, fee not kept, esc
   assert.deepEqual(r.ins.transition.shares, ["seller", "reward", "fee"]);
   assert.equal(r.ins.fiat_usd_cents, 200);
   assert.equal(r.ins.due_zat, 6_250_000);
-  assert.deepEqual(pays(r.ins), [["buyer", 5_000_000], ["reserve", 35_000]]);
+  assert.deepEqual(pays(r.ins), [["buyer", 5_000_000], ["reserve", 30_000]]);
   assert.deepEqual(r.ins.reserve_topup, { to: BUYER, party: "buyer", zat: 1_250_000 });
   assert.equal(r.ins.change, null);
   assert.deepEqual(d.s.shares, { seller: "refunded", reward: "refunded", fee: "waived" });
@@ -193,7 +202,7 @@ test("full refund: 100% of the fiat value at the refund quote, fee not kept, esc
   const u = new Deal();
   u.fund(40);
   const ru = u.stage("refund", 50, buyer);
-  assert.deepEqual(pays(ru.ins), [["buyer", 4_000_000], ["reserve", 1_035_000]]);
+  assert.deepEqual(pays(ru.ins), [["buyer", 4_000_000], ["reserve", 1_030_000]]);
   assert.equal(ru.ins.reserve_topup, null);
 });
 
@@ -210,7 +219,7 @@ test("refund after the seller is paid needs an arbiter decision, and returns onl
   const r = d.stage("refund", 40, buyer);
   assert.deepEqual(r.ins.transition.shares, ["reward", "fee"]);
   assert.equal(r.ins.fiat_usd_cents, 10);
-  assert.deepEqual(pays(r.ins), [["buyer", 250_000], ["reserve", 25_000]]);
+  assert.deepEqual(pays(r.ins), [["buyer", 250_000], ["reserve", 20_000]]);
   assert.equal(d.s.shares.seller, "paid");
   assert.equal(d.s.status, "closed");
 });

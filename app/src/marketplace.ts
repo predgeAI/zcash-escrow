@@ -24,7 +24,7 @@ import {
 } from "./deal.ts";
 import {
   STATE, ageFile, balance, ensureBuyerFunds, ensureWallet, fmt, frostSign, jobDir, makeEscrowGroup, minedHeight, partyAddress,
-  partyDir, setup, waitChain, waitIndexer, walletDir, zip321Uri, type Party,
+  partyDir, waitChain, waitIndexer, walletDir, zip321Uri, type Party,
 } from "./escrow.ts";
 import { localQuoteSigner, type SignedQuote } from "./pricelock.ts";
 import { LIGHTWALLETD, NETWORK, TESTNET, devtool, mine, say } from "./tools.ts";
@@ -45,6 +45,8 @@ export interface MarketDeal {
   stages: StageRecord[];
   fund_txid?: string;
   fund_height?: number;
+  /** The quote the deposit was computed from, and when the buyer sent it (saved before sending). */
+  funding?: { quote: SignedQuote; paid_at: string };
 }
 
 const dealFile = (id: string) => join(jobDir(id), "deal.json");
@@ -110,18 +112,30 @@ function appendEvent(d: MarketDeal, event: DealEvent, issuer: "operator" | "arbi
 export const operatorEvent = (id: string, e: DealEvent) => appendEvent(loadDeal(id), e, "operator");
 export const arbiterEvent = (id: string, e: DealEvent) => appendEvent(loadDeal(id), e, "arbiter");
 
-/** The buyer funds the fiat amount at the funding quote, plus the network fee budget. */
+/**
+ * The buyer funds the fiat amount at the funding quote, plus the network fee budget. Resumable:
+ * the quote and payment time are saved before the send, and a deposit the escrow wallet already
+ * sees is not sent again.
+ */
 export async function fundDeal(id: string, quote: SignedQuote): Promise<MarketDeal> {
   const d = loadDeal(id);
+  const ew = join(jobDir(id), "wallet");
+  if (dealState(d).status !== "created") return d; // resumed after funding
+  if (d.funding) quote = d.funding.quote;
   const need = fundingZat(d.terms, quote);
   say(`== deal ${id}: buyer funds ${fmt(need)} ($${(d.terms.amount_usd_cents / 100).toFixed(2)} at $${(quote.quote.price_micros / 1e6).toFixed(2)}/ZEC + ${d.terms.network_fee_budget_zat} zat network fee budget)`);
-  await ensureBuyerFunds(need + 20_000);
-  const termsHash = sha256(canonical(d.terms));
-  const out = devtool(["wallet", "-w", walletDir("buyer"), "send", "-i", ageFile("buyer"), "--address", d.terms.escrow_address,
-    "--value", String(need), "--memo", `zescrow fund ${id} terms ${termsHash.slice(0, 16)}`, "-s", LIGHTWALLETD]);
-  d.fund_txid = out.trim().split("\n").pop();
-  saveDeal(d);
-  const ew = join(jobDir(id), "wallet");
+  if (!d.fund_txid && balance(ew).total === 0) {
+    await ensureBuyerFunds(need + 20_000);
+    d.funding = { quote, paid_at: new Date().toISOString() };
+    saveDeal(d);
+    const termsHash = sha256(canonical(d.terms));
+    const out = devtool(["wallet", "-w", walletDir("buyer"), "send", "-i", ageFile("buyer"), "--address", d.terms.escrow_address,
+      "--value", String(need), "--memo", `zescrow fund ${id} terms ${termsHash.slice(0, 16)}`, "-s", LIGHTWALLETD]);
+    d.fund_txid = out.trim().split("\n").pop();
+    saveDeal(d);
+  } else {
+    say("  deposit already sent; resuming");
+  }
   if (TESTNET) {
     say(`  fund tx ${d.fund_txid}`);
     await waitChain("the deposit to confirm in the escrow wallet", () => { const b = balance(ew); return { ok: b.ironwood >= need, tip: b.tip }; }, 120);
@@ -132,7 +146,10 @@ export async function fundDeal(id: string, quote: SignedQuote): Promise<MarketDe
   }
   const b = balance(ew);
   saveDeal(d);
-  appendEvent(d, { type: "funded", funded_zat: b.ironwood, quote, fund_txid: d.fund_txid }, "operator");
+  if (!d.fund_txid) d.fund_txid = (JSON.parse(devtool(["wallet", "-w", ew, "list-tx", "--json"], { quiet: true }).trim().split("\n").pop()!) as { txid: string }[])[0]?.txid;
+  if (!d.fund_height && d.fund_txid) d.fund_height = minedHeight(ew, d.fund_txid);
+  saveDeal(d);
+  appendEvent(d, { type: "funded", funded_zat: b.ironwood, quote, paid_at: d.funding!.paid_at, fund_txid: d.fund_txid }, "operator");
   say(`  escrow holds ${fmt(b.ironwood)} (tx ${d.fund_txid?.slice(0, 16)}…)`);
   return d;
 }
@@ -181,13 +198,14 @@ export async function runStage(id: string, stage: StageKind, quote: SignedQuote,
     // instead of back to the escrow. The signers' `--change-to-group` check refuses it.
     say("  try: build this stage with the remainder sent to the marketplace's own address instead of back to the escrow");
     const bad = buildStagePczt(id, ss, join(jobDir(id), `stage-${ins.seq}-diverted.pczt`),
-      [...ins.payments, { to: d.terms.fee_address, party: "marketplace_fee", zat: ins.change.zat, purpose: "surplus" }]);
+      // One more paying output (and the wallet's zero change): the network fee rises by 5,000 zat.
+      [...ins.payments, { to: d.terms.fee_address, party: "marketplace_fee", zat: ins.change.zat - 5_000, purpose: "surplus" }]);
     try {
       checkPayout(bad, signerExpect(d, ss, "policy"), d.terms.group_ak);
       throw new Error("policy co-signer accepted a diverted remainder (unexpected)");
     } catch (e) {
       if (/unexpected/.test(String(e))) throw e;
-      say(`  -> policy co-signer refuses: ${(e as Error).message.split("\n").filter(Boolean).pop()}`);
+      say(`  -> policy co-signer refuses: ${/Error: (.*)/.exec((e as Error).message)?.[1] ?? (e as Error).message}`);
     }
     if (opts.fixtures) writeFileSync(join(opts.fixtures, "stage-diverted.proven.pczt"), readFileSync(bad));
   }
@@ -247,19 +265,19 @@ export async function payTopup(id: string, seq: number, maxMinutes = 45): Promis
  * (shortfall topped up by the reserve); the marketplace collects its 1% at $40 and the escrow
  * ends empty. Also shows two refusals: a remainder diverted away from the escrow, and a replay.
  */
-export async function marketplaceScenario(opts: { fixtures?: string } = {}) {
-  await setup();
-  const run = Date.now().toString(36);
-  const id = `M-${run}`;
+export async function marketplaceScenario(opts: { fixtures?: string; resume?: string } = {}) {
+  const id = opts.resume ?? `M-${Date.now().toString(36)}`;
   const q = quoteSigner();
   const t0 = Date.now();
-  createDeal(id, 200);
+  if (!opts.resume) createDeal(id, 200);
   await fundDeal(id, q.quote(40_000_000));
 
-  say("  try: seller payout before delivery");
-  try { planStage(dealState(loadDeal(id)), { stage: "seller_payout", quote: q.quote(40_000_000), recipient: bindAddress("seller", partyAddress("seller")) }); }
-  catch (e) { say(`  -> refused: ${(e as Error).message}`); }
-  operatorEvent(id, { type: "delivered" });
+  if (!dealState(loadDeal(id)).delivered) {
+    say("  try: seller payout before delivery");
+    try { planStage(dealState(loadDeal(id)), { stage: "seller_payout", quote: q.quote(40_000_000), recipient: bindAddress("seller", partyAddress("seller")) }); }
+    catch (e) { say(`  -> refused: ${(e as Error).message}`); }
+    operatorEvent(id, { type: "delivered" });
+  } else say("  resumed: funded and delivered");
 
   const seller = bindAddress("seller", partyAddress("seller"));
   const buyer = bindAddress("buyer", partyAddress("buyer"));

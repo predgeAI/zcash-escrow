@@ -4,6 +4,33 @@
 
 ### Added
 
+- Marketplace mode (`docs/marketplace-mode.md`). A deal with fiat-denominated terms (USD cents,
+  split 9500/400/100 bps by default) is paid out in stages from one 2-of-3 FROST escrow held by
+  the marketplace operator, a policy co-signer and an independent arbiter. Each stage spends the
+  escrow and sends the rest back to the escrow group's own internal address as change.
+  `zescrow-frost outputs` / `sign-pczt` take `--change-to-group <escrow UFVK>` with
+  `--change-exact` or `--change-min`. Change is accepted only to an address of the UFVK's
+  internal scope, and the UFVK's `ak` must be the signing share's FROST group key. A payment to the
+  escrow's own address is refused, and so is any other unnamed output. All existing checks still
+  apply. `keygen --parties` names the share holders.
+- Deal state machine (`app/src/deal.ts`): signed, one-shot event log (funded, delivered, review,
+  review_updated, dispute_opened, arbiter-only dispute_resolved). Stages are seller payout,
+  review reward (before or after the seller payout), fee (after the seller payout) and refund
+  (every unpaid share, fee included). A negative review freezes only the unpaid seller share,
+  an updated review releases it, and no payout is reversed. A dispute stops every stage until the
+  arbiter resolves it.
+- Stage instructions, `predge.zescrow.verdict/3` kind `stage`: deal, stage id, transition, quote,
+  payments, reserve top-up, network fee and exact change, Ed25519-signed by the operator or the
+  arbiter. Signers re-plan the stage from their own replica and refuse anything else. Each signer
+  keeps a ledger of stage ids, so a replayed stage is refused. `zescrow verify` reads them.
+- PriceLock (`app/src/pricelock.ts`): Ed25519-signed ZEC/USD median quotes with a maximum age and
+  a tolerance against the signer's own reference price. Each stage pays fiat / price; a surplus
+  goes to the marketplace reserve in the same transaction, and a shortfall is recorded as a top-up
+  the reserve pays. Late payout addresses are bound into the instruction by operator attestation,
+  plus the party's own signature when the terms register a key for it.
+- Testnet path `M` (`npm run testnet -- M`): fund, then the seller's 95% with change back to the
+  escrow, a negative review after that payout, the 4% reward, the 1% fee, and an empty escrow.
+
 - Marketplace fee. Deal terms take an optional `marketplace_fee` (`bps` rounded down or
   `fixed_zat`, and `on_refund: keep | return`). The payout then has two outputs, the winner and
   the fee address, and no change. `zescrow-frost outputs` / `sign-pczt` take `--exact

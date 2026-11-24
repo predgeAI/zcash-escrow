@@ -1547,4 +1547,93 @@ mod tests {
         let err = check_pczt(FEE_RELEASE, &p).unwrap_err().to_string();
         assert!(err.contains("outputs to other addresses"), "{err}");
     }
+
+    // ---- a real staged payout from public testnet (path M, stage 1) ----
+
+    /// Stage 1 of testnet deal M-mwutpicz: seller 4_318_181, reserve 431_819 (surplus), change
+    /// 280_000 back to the escrow's internal address, ZIP 317 fee 15_000 (3 actions).
+    const STAGE: &[u8] = include_bytes!("../tests/fixtures/testnet-stage-change.proven.pczt");
+    /// The same stage built with the remainder (275_000) paid to the marketplace's fee address
+    /// instead of back to the escrow (one more output, so 20_000 fee).
+    const STAGE_DIVERTED: &[u8] =
+        include_bytes!("../tests/fixtures/testnet-stage-diverted.proven.pczt");
+    const STAGE_UFVK: &str = "uviewtest10hzn9jvakhmy9g9cj20hk70nh9ag6c979qygzfz4szkw9t646s5r8xqztph20ktsyde65ryvmepeattend5e60r9g25xaezp4qt49dtsx97wzxnetnwvja2dfdppcs9mfwydjjgknng8axhmexcaufnewcs0pal42dq8768vq8ds2akn7qdceks0lm8sx";
+    const STAGE_AK: &str = "ad137afd46427f569102c6345611e25398e6a8d44e92f256fb43ec36e7cde22f";
+    const STAGE_RESERVE: &str = "utest103cv9dfmfqhkv8ptjlwmmyh84prafu3ktam8uva43sqckszt8jmdcafctrlx634sxaa2ucc5790t7q997juc2zje3ynxv6p7hqwvurq7";
+    const STAGE_MEMO: &str = "zescrow stage c468cd78052dd02a5ca26f3d4a2c407d";
+    const STAGE_SIGHASH: &str = "93f17ae3d01b83c6caf3de595f132d2b487e4b0189f68030784e18cb537762c2";
+
+    fn stage_pol(ufvk: Option<&str>, amount: ChangeAmount) -> Policy {
+        let change = ufvk.map(|u| ChangePolicy::from_ufvk(u, amount).unwrap());
+        policy_with(
+            TESTNET_SELLER,
+            4_318_181,
+            Some(4_318_181),
+            Some(STAGE_MEMO),
+            &[format!("{STAGE_RESERVE}:431819")],
+            change,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn staged_payout_with_change_to_the_group_passes_every_check() {
+        let c =
+            check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000))).unwrap();
+        assert_eq!((c.fee, c.actions), (15_000, 3));
+        assert_eq!(c.sighash, STAGE_SIGHASH);
+        let change: Vec<_> = c.outputs.iter().filter(|o| o.to_group).collect();
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].value, 280_000);
+        // The change ciphertext opened too: the escrow's own wallet sees its change note.
+        assert!(change[0].memo.is_some());
+        let ufvk = ChangePolicy::from_ufvk(STAGE_UFVK, ChangeAmount::Min(0)).unwrap();
+        ufvk.check_group_ak(&hex::decode(STAGE_AK).unwrap()).unwrap();
+        check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Min(280_000))).unwrap();
+    }
+
+    #[test]
+    fn staged_payout_change_amount_must_match() {
+        for amount in
+            [ChangeAmount::Exact(279_999), ChangeAmount::Exact(280_001), ChangeAmount::Min(280_001)]
+        {
+            let err =
+                check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), amount)).unwrap_err().to_string();
+            assert!(err.contains("sends 280000 zat of change to the escrow group"), "{err}");
+        }
+    }
+
+    #[test]
+    fn change_anywhere_but_the_signing_groups_internal_address_is_refused() {
+        // No change policy: the escrow's own change output is an output to another address.
+        let err = check_pczt(STAGE, &stage_pol(None, ChangeAmount::Exact(0))).unwrap_err();
+        assert!(err.to_string().contains("outputs to other addresses"), "{err}");
+        // Another group's UFVK: the same output is not its change.
+        let (_, other) = group_key(7);
+        let err =
+            check_pczt(STAGE, &stage_pol(Some(&other), ChangeAmount::Exact(280_000))).unwrap_err();
+        assert!(err.to_string().contains("outputs to other addresses"), "{err}");
+        // The remainder paid to the marketplace instead of back to the escrow.
+        let err =
+            check_pczt(STAGE_DIVERTED, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000)))
+                .unwrap_err();
+        assert!(err.to_string().contains("outputs to other addresses"), "{err}");
+        // Even with the right UFVK, a signer whose FROST group is another one refuses.
+        let r = round(&hex::decode(STAGE_SIGHASH).unwrap());
+        let (id, kp) = r.keys.iter().next().unwrap();
+        let alpha = check_pczt(STAGE, &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000)))
+            .unwrap()
+            .alphas[0]
+            .clone();
+        let err = sign_pczt(
+            STAGE,
+            &stage_pol(Some(STAGE_UFVK), ChangeAmount::Exact(280_000)),
+            &r.pkg,
+            &r.nonces[id],
+            kp,
+            &alpha,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not this FROST group's key"), "{err}");
+    }
 }

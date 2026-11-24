@@ -76,7 +76,8 @@ export interface DealTerms {
 export type Sentiment = "positive" | "negative";
 
 export type DealEvent =
-  | { type: "funded"; funded_zat: number; quote: SignedQuote; fund_txid?: string }
+  /** `paid_at`: when the buyer sent the deposit, computed from `quote`, which must be fresh then. */
+  | { type: "funded"; funded_zat: number; quote: SignedQuote; paid_at: string; fund_txid?: string }
   | { type: "delivered" }
   | { type: "review"; sentiment: Sentiment }
   | { type: "review_updated"; sentiment: Sentiment }
@@ -214,7 +215,11 @@ export function applyEvent(state: DealState, se: SignedEvent): DealState {
   switch (ev.type) {
     case "funded": {
       if (s.status !== "created") illegal("deal is already funded");
-      quoteOk(ev.quote, t, new Date(e.at));
+      // The deposit was computed from the quote when the buyer paid; confirmations take longer
+      // than a quote lives, so freshness is judged at payment time, which cannot be after the event.
+      const paid = Date.parse(ev.paid_at);
+      if (!Number.isFinite(paid) || paid > Date.parse(e.at) + 60_000) illegal("funding paid_at is missing or after the event");
+      quoteOk(ev.quote, t, new Date(paid));
       const principal = zatForFiat(t.amount_usd_cents, ev.quote.quote.price_micros);
       if (ev.funded_zat !== principal + t.network_fee_budget_zat)
         illegal(`escrow funded with ${ev.funded_zat} zat, expected ${principal + t.network_fee_budget_zat} (principal ${principal} + network fee budget ${t.network_fee_budget_zat})`);
@@ -431,9 +436,16 @@ export function planStage(s: DealState, req: StageRequest): StageInstruction {
   let change: number;
   let fee: number;
   if (final) {
-    // The last stage empties the escrow: unused network fee budget goes to the reserve with any surplus.
-    fee = zip317Fee(2);
+    // The last stage empties the escrow: unused network fee budget goes to the reserve with any
+    // surplus. zcash-devtool's `pczt create` always adds a change output (here of zero value), so
+    // the actions are the payments plus one.
+    fee = zip317Fee(1 + 1 + 1);
     reserve = s.escrow_zat - obligation - fee;
+    if (reserve <= 0) {
+      fee = zip317Fee(1 + 1);
+      reserve = s.escrow_zat - obligation - fee;
+      if (reserve > 0) illegal(`the last ${reserve} zat cannot pay for their own output`);
+    }
     change = 0;
   } else {
     reserve = surplus;

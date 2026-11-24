@@ -108,7 +108,7 @@ export async function testnet(paths: string[]) {
     } else if (path === "M") {
       // Marketplace mode: staged payouts with change back to the escrow, fiat terms, PriceLock.
       if (MAINNET) throw new Error("path M runs on testnet only");
-      await marketplaceScenario({ fixtures: process.env.ZESCROW_FIXTURES });
+      await marketplaceScenario({ fixtures: process.env.ZESCROW_FIXTURES, resume: process.env.ZESCROW_RESUME });
     } else if (path === "C") {
       const data = Buffer.from("weather-dataset.csv " + run);
       const c = createJob(`C-${run}`, { name: "Weather dataset", bytes: data, price_zat: Math.round(0.05 * k * ZEC) });
